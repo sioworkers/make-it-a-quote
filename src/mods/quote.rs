@@ -12,6 +12,7 @@ use twilight_util::builder::command::StringBuilder;
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Result, console_error, js_sys::Uint8Array};
 
 const API: &str = "https://discord.com/api/v10";
+const SRC: &str = "https://github.com/sioworkers/make-it-a-quote";
 
 pub struct Quote;
 
@@ -127,7 +128,7 @@ async fn make(i: &Interaction, m: &Message) -> Result<()> {
 	let name = m.author.global_name.clone().unwrap_or_else(|| m.author.name.clone());
 	let png = card::render(av.as_ref(), img.as_ref(), &text, &name, &format!("@{}", m.author.name));
 	let g = i.guild_id.map_or("@me".into(), |g| g.to_string());
-	edit(i, &format!("-# [Source](https://discord.com/channels/{g}/{}/{})", m.channel_id, m.id), Some(png)).await
+	edit(i, &format!("-# [Jump to message](<https://discord.com/channels/{g}/{}/{}>) | [Source](<{SRC}>)", m.channel_id, m.id), Some(png)).await
 }
 
 async fn edit(i: &Interaction, s: &str, png: Option<Vec<u8>>) -> Result<()> { // PATCH @original, multipart when there's a file

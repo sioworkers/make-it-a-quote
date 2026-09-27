@@ -24,9 +24,11 @@ jobs:
           secrets: |
             PUBLIC_KEY
             DISCORD_TOKEN
+            CLIENT_SECRET
         env:
           PUBLIC_KEY: ${{ vars.PUBLIC_KEY }}
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
       - name: register cmds
         run: |
           curl -sS --fail-with-body -X PUT "https://discord.com/api/v10/applications/$APP/commands" -H "Authorization: Bot $TOKEN" -H "Content-Type: application/json" --data-binary @cmds.json
