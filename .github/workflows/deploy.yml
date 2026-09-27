@@ -22,8 +22,10 @@ jobs:
           accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           secrets: |
             PUBLIC_KEY
+            DISCORD_TOKEN
         env:
           PUBLIC_KEY: ${{ vars.PUBLIC_KEY }}
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
       - name: register cmds
         run: |
           curl -fsS --retry 10 --retry-delay 5 --retry-all-errors "$URL/cmds" | curl -sS --fail-with-body -X PUT "https://discord.com/api/v10/applications/$APP/commands" -H "Authorization: Bot $TOKEN" -H "Content-Type: application/json" --data-binary @-

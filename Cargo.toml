@@ -9,8 +9,10 @@ description = "Make It a Quote bot, but free"
 crate-type = ["cdylib"]
 
 [dependencies]
+ab_glyph = "0.2"
 ed25519-dalek = "3"
 hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 serde_json = "1"
 twilight-model = "0.17"
 twilight-util = { version = "0.17", features = ["builder"] }
