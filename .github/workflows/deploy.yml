@@ -13,14 +13,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: cargo clippy --all-targets -- -D warnings
-      - uses: shuttle-hq/deploy-action@v2
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - id: cf
+        uses: cloudflare/wrangler-action@v4
         with:
-          shuttle-api-key: ${{ secrets.SHUTTLE_API_KEY }}
-          project-id: ${{ vars.SHUTTLE_PROJECT_ID }}
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           secrets: |
-            DISCORD_TOKEN = '${{ secrets.DISCORD_TOKEN }}'
-            CLIENT_ID = '${{ vars.CLIENT_ID }}'
-            PRESENCE = '${{ vars.PRESENCE }}'
-            ACTIVITY_TYPE = '${{ vars.ACTIVITY_TYPE }}'
-            ACTIVITY = '${{ vars.ACTIVITY }}'
+            PUBLIC_KEY
+        env:
+          PUBLIC_KEY: ${{ vars.PUBLIC_KEY }}
+      - name: register cmds
+        run: curl -fsS "$URL/cmds" | curl -fsS -o /dev/null -X PUT "https://discord.com/api/v10/applications/$APP/commands" -H "Authorization: Bot $TOKEN" -H "Content-Type: application/json" --data-binary @-
+        env:
+          URL: ${{ steps.cf.outputs.deployment-url }}
+          APP: ${{ vars.CLIENT_ID }}
+          TOKEN: ${{ secrets.DISCORD_TOKEN }}

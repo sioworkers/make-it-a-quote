@@ -1,42 +1,34 @@
-use crate::ctx::Ctx;
-use anyhow::Result;
-use std::sync::Arc;
-use twilight_gateway::Event;
 use twilight_model::{
-	application::{command::{Command, CommandType}, interaction::{Interaction, InteractionContextType, InteractionData, application_command::CommandData}},
-	gateway::Intents,
+	application::{command::{Command, CommandType}, interaction::{Interaction, InteractionContextType, application_command::CommandData}},
+	channel::message::{AllowedMentions, MessageFlags},
+	http::interaction::{InteractionResponse, InteractionResponseType},
 	oauth::ApplicationIntegrationType,
 };
-use twilight_util::builder::command::CommandBuilder;
+use twilight_util::builder::{InteractionResponseDataBuilder, command::CommandBuilder};
+use worker::{Env, Result, console_error};
+
+pub trait Mod {
+	const NAMES: &[&str]; // slash/menu cmd names
+	fn cmds() -> Vec<Command>;
+	async fn run(env: &Env, i: &Interaction, d: &CommandData) -> Result<InteractionResponse>;
+}
 
 pub fn cmd(n: &str, d: &str, k: CommandType) -> CommandBuilder { // user + server install, usable anywhere
 	CommandBuilder::new(n, d, k).integration_types([ApplicationIntegrationType::UserInstall, ApplicationIntegrationType::GuildInstall]).contexts([InteractionContextType::Guild, InteractionContextType::BotDm, InteractionContextType::PrivateChannel])
 }
 
-pub trait Mod: Sized {
-	const NAMES: &[&str] = &[]; // slash/menu cmd names
-	const INTENTS: Intents = Intents::empty();
-	fn load() -> Result<Self>;
-	fn cmds(&self) -> Vec<Command> { vec![] }
-	async fn run(&self, _: &Arc<Ctx>, _: &Interaction, _: &CommandData) -> Result<()> { Ok(()) }
-	async fn event(&self, _: &Arc<Ctx>, _: &Event) -> Result<()> { Ok(()) } // every gw event except cmds
+pub fn reply(s: &str) -> InteractionResponse { // ephemeral
+	let d = InteractionResponseDataBuilder::new().content(s).flags(MessageFlags::EPHEMERAL).allowed_mentions(AllowedMentions::default()).build();
+	InteractionResponse { kind: InteractionResponseType::ChannelMessageWithSource, data: Some(d) }
 }
 
 macro_rules! mods {
 	($($m:ident: $t:ty),* $(,)?) => {
 		$(pub mod $m;)*
-		pub struct Mods { $(pub $m: $t,)* }
-		impl Mods {
-			pub fn load() -> Result<Self> { Ok(Mods { $($m: <$t>::load()?,)* }) }
-			pub fn intents() -> Intents { Intents::empty() $(| <$t>::INTENTS)* }
-			pub fn cmds(&self) -> Vec<Command> { [$(self.$m.cmds(),)*].concat() }
-			async fn run(&self, ctx: &Arc<Ctx>, i: &Interaction, d: &CommandData) -> Result<()> {
-				$(if <$t>::NAMES.contains(&d.name.as_str()) { return self.$m.run(ctx, i, d).await; })*
-				Ok(())
-			}
-			async fn event(&self, ctx: &Arc<Ctx>, e: &Event) {
-				$(if let Err(err) = self.$m.event(ctx, e).await { eprintln!("{}: {err}", stringify!($m)); })*
-			}
+		pub fn cmds() -> Vec<Command> { [$(<$t>::cmds(),)*].concat() }
+		async fn run(env: &Env, i: &Interaction, d: &CommandData) -> Result<InteractionResponse> {
+			$(if <$t>::NAMES.contains(&d.name.as_str()) { return <$t>::run(env, i, d).await; })*
+			Ok(reply("Unknown command."))
 		}
 	};
 }
@@ -45,10 +37,6 @@ mods! {
 	ping: ping::Ping,
 }
 
-pub async fn dispatch(ctx: Arc<Ctx>, e: Event) {
-	if let Event::InteractionCreate(i) = &e && let Some(InteractionData::ApplicationCommand(d)) = &i.data {
-		if let Err(err) = ctx.mods.run(&ctx, i, d).await { eprintln!("/{}: {err}", d.name); }
-		return;
-	}
-	ctx.mods.event(&ctx, &e).await;
+pub async fn dispatch(env: &Env, i: &Interaction, d: &CommandData) -> InteractionResponse {
+	run(env, i, d).await.unwrap_or_else(|e| { console_error!("{}: {e}", d.name); reply("Something went wrong.") })
 }
