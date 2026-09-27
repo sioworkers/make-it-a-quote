@@ -33,7 +33,8 @@ async fn interaction(mut req: Request, cx: &mods::Cx) -> Result<Response> {
 
 #[event(fetch)]
 async fn fetch(req: Request, env: Env, wc: Context) -> Result<Response> {
-	match (req.method(), req.path().as_str()) {
+	let m = match req.method() { Method::Head => Method::Get, m => m }; // HEAD = GET, runtime drops the body
+	match (m, req.path().as_str()) {
 		(Method::Post, "/") => interaction(req, &mods::Cx { env, wc }).await,
 		(Method::Get, "/cmds") => Response::from_json(&mods::cmds()), // what this version registers
 		(Method::Get, "/") => web::home(&req, &env),
