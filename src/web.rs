@@ -2,6 +2,7 @@ use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Response, Result
 
 const HEAD: &str = include_str!("../web/partials/head.html");
 const FOOT: &str = include_str!("../web/partials/footer.html");
+const NAV: &str = include_str!("../web/partials/nav.html");
 const HOME: &str = include_str!("../web/templates/index.html");
 const DONE: &str = include_str!("../web/templates/done.html");
 pub const TERMS: &str = include_str!("../web/templates/terms.html");
@@ -11,7 +12,7 @@ const LOGO: &[u8] = include_bytes!("../web/static/logo.png"); // favicon
 const BUBBLE: &[u8] = include_bytes!("../web/static/bubble.png"); // page logo, cropped
 
 pub fn page(t: &str, kv: &[(&str, &str)]) -> Result<Response> { // %%key%% -> val, vals are ours, never user input
-	let mut s = t.replace("%%head%%", HEAD).replace("%%footer%%", FOOT);
+	let mut s = t.replace("%%head%%", HEAD).replace("%%footer%%", FOOT).replace("%%nav%%", NAV);
 	for (k, v) in kv { s = s.replace(&format!("%%{k}%%"), v); }
 	Response::from_html(s)
 }
