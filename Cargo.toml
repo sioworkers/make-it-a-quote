@@ -1,0 +1,16 @@
+[package]
+name = "miaq"
+version = "0.1.0"
+edition = "2024"
+authors = ["hx4c"]
+description = "Make It a Quote bot, but free"
+
+[dependencies]
+anyhow = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+shuttle-runtime = "0.57"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
+twilight-gateway = { version = "0.17", default-features = false, features = ["rustls-webpki-roots", "zstd"] }
+twilight-http = { version = "0.17", default-features = false, features = ["rustls-webpki-roots", "decompression"] }
+twilight-model = "0.17"
+twilight-util = { version = "0.17", features = ["builder"] }
