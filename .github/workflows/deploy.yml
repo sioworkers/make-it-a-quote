@@ -25,7 +25,8 @@ jobs:
         env:
           PUBLIC_KEY: ${{ vars.PUBLIC_KEY }}
       - name: register cmds
-        run: curl -fsS "$URL/cmds" | curl -fsS -o /dev/null -X PUT "https://discord.com/api/v10/applications/$APP/commands" -H "Authorization: Bot $TOKEN" -H "Content-Type: application/json" --data-binary @-
+        run: |
+          curl -fsS "$URL/cmds" | curl -fsS -o /dev/null -X PUT "https://discord.com/api/v10/applications/$APP/commands" -H "Authorization: Bot $TOKEN" -H "Content-Type: application/json" --data-binary @-
         env:
           URL: ${{ steps.cf.outputs.deployment-url }}
           APP: ${{ vars.CLIENT_ID }}
