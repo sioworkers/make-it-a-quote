@@ -22,6 +22,14 @@ p { color: var(--dim); margin: 0 0 1rem; }
 .btn-p:hover { background: var(--acc-l); border-color: var(--acc-l); }
 .btn-g { background: var(--panel); color: var(--fg); }
 .btn-g:hover { border-color: #3a3a44; }
-footer { max-width: 40rem; width: 100%; margin: 0 auto; padding: 1.5rem 1rem; border-top: 1px solid var(--line); font-size: .9rem; }
+footer { max-width: 40rem; width: 100%; margin: 0 auto; padding: 1.5rem 1rem; border-top: 1px solid var(--line); font-size: .9rem; display: flex; flex-wrap: wrap; gap: 1.25rem; }
 footer a { color: var(--dim); }
+footer a:hover { color: var(--fg); }
+.doc { padding-top: 4rem; }
+.doc h1 { font-size: 2rem; }
+.doc h2 { margin: 2rem 0 .5rem; font-size: 1.15rem; }
+.doc ul { color: var(--dim); margin: 0 0 1rem; padding-left: 1.25rem; }
+.doc li { margin: .25rem 0; }
+.doc a, .doc strong { color: var(--fg); }
+.meta { font-size: .9rem; }
 :focus-visible { outline: 2px solid var(--acc-l); outline-offset: 2px; }

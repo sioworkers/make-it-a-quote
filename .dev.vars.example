@@ -1,2 +1,3 @@
 PUBLIC_KEY = "your-app-public-key"
 DISCORD_TOKEN = "your-bot-token" # only for /quote <link>
+CLIENT_SECRET = "your-client-secret" # finishes installs on /done

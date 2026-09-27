@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		%%head%%
+	</head>
+	<body>
+		<main class="doc">
+			<h1>Privacy Policy</h1>
+			<p class="meta">Last updated 2026-09-27</p>
+			<p>MIAQ turns a Discord message into a quote image. This page says what it sees and what it keeps. Short version: it keeps nothing.</p>
+			<h2>What MIAQ gets</h2>
+			<p>Only when you use <strong>Quote</strong> or <strong>/quote</strong>, Discord sends MIAQ:</p>
+			<ul>
+				<li>the message you picked: its text, attachments and embeds</li>
+				<li>the author's display name, username and avatar</li>
+				<li>the channel, server and message IDs, and a short-lived token to reply with</li>
+			</ul>
+			<p>For <strong>/quote</strong> with a link, MIAQ asks Discord for that one message itself, and only if it's in the channel you ran the command in.</p>
+			<h2>What it does with it</h2>
+			<p>It downloads the author's avatar and the first image in the message, draws the quote image, and posts it as the reply to your command. All of that happens in memory during that one request.</p>
+			<h2>What it keeps</h2>
+			<p>Nothing. MIAQ has no database and doesn't save messages, images, names or IDs. The quote image only exists in the Discord message it posts, which you can delete like any other message.</p>
+			<p>When you add MIAQ, Discord sends back a one-time code. MIAQ trades it with Discord to finish the install and throws the result away.</p>
+			<h2>Hosting</h2>
+			<p>MIAQ runs on Cloudflare Workers. Cloudflare may keep normal request logs such as IP address and time, see the <a href="https://www.cloudflare.com/privacypolicy/">Cloudflare Privacy Policy</a>. MIAQ's own error messages can include technical details like image URLs. They are only visible live while debugging and aren't saved.</p>
+			<h2>Removing it</h2>
+			<p>Remove MIAQ from User Settings, Authorized Apps, or from a server's Integrations settings. Since nothing is stored, there's nothing else to delete.</p>
+			<h2>Contact</h2>
+			<p>Questions go to the <a href="https://github.com/sioworkers/make-it-a-quote/issues">GitHub issues</a>.</p>
+		</main>
+		%%footer%%
+	</body>
+</html>
