@@ -5,12 +5,17 @@ use twilight_model::{
 	oauth::ApplicationIntegrationType,
 };
 use twilight_util::builder::{InteractionResponseDataBuilder, command::CommandBuilder};
-use worker::{Env, Result, console_error};
+use worker::{Context, Env, Result, console_error};
+
+pub struct Cx {
+	pub env: Env,
+	pub wc: Context, // for wait_until
+}
 
 pub trait Mod {
 	const NAMES: &[&str]; // slash/menu cmd names
 	fn cmds() -> Vec<Command>;
-	async fn run(env: &Env, i: &Interaction, d: &CommandData) -> Result<InteractionResponse>;
+	async fn run(cx: &Cx, i: &Interaction, d: &CommandData) -> Result<InteractionResponse>;
 }
 
 pub fn cmd(n: &str, d: &str, k: CommandType) -> CommandBuilder { // user + server install, usable anywhere
@@ -26,17 +31,17 @@ macro_rules! mods {
 	($($m:ident: $t:ty),* $(,)?) => {
 		$(pub mod $m;)*
 		pub fn cmds() -> Vec<Command> { [$(<$t>::cmds(),)*].concat() }
-		async fn run(env: &Env, i: &Interaction, d: &CommandData) -> Result<InteractionResponse> {
-			$(if <$t>::NAMES.contains(&d.name.as_str()) { return <$t>::run(env, i, d).await; })*
+		async fn run(cx: &Cx, i: &Interaction, d: &CommandData) -> Result<InteractionResponse> {
+			$(if <$t>::NAMES.contains(&d.name.as_str()) { return <$t>::run(cx, i, d).await; })*
 			Ok(reply("Unknown command."))
 		}
 	};
 }
 
 mods! {
-	ping: ping::Ping,
+	quote: quote::Quote,
 }
 
-pub async fn dispatch(env: &Env, i: &Interaction, d: &CommandData) -> InteractionResponse {
-	run(env, i, d).await.unwrap_or_else(|e| { console_error!("{}: {e}", d.name); reply("Something went wrong.") })
+pub async fn dispatch(cx: &Cx, i: &Interaction, d: &CommandData) -> InteractionResponse {
+	run(cx, i, d).await.unwrap_or_else(|e| { console_error!("{}: {e}", d.name); reply("Something went wrong.") })
 }
