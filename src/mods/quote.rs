@@ -15,7 +15,8 @@ use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Result, Url, con
 const API: &str = "https://discord.com/api/v10";
 const SRC: &str = "https://github.com/sioworkers/make-it-a-quote";
 const FB: &[&str] = &["Noto Sans Math", "Noto Emoji", "Noto Sans Symbols 2", "Noto Sans Symbols", "Noto Sans JP", "Noto Sans KR", "Noto Sans SC", "Noto Sans Arabic", "Noto Sans Hebrew", "Noto Sans Devanagari", "Noto Sans Thai"]; // fallback order
-const MAX_PX: u64 = 2_000_000; // decode cap, bigger = cpu limit
+const MAX_PX: u64 = 4_200_000; // decode cap (~2048x2048), bigger = cpu limit
+const UA: &str = "Mozilla/5.0 (compatible; MIAQ; +https://miaq.sioworker.workers.dev)";
 
 pub struct Quote;
 
@@ -65,7 +66,9 @@ async fn get(env: &Env, c: Id<ChannelMarker>, m: Id<MessageMarker>) -> Option<Me
 }
 
 async fn fetch(url: &str) -> Result<Vec<u8>> {
-	let mut r = Fetch::Url(url.parse()?).send().await?;
+	let h = Headers::new();h.set("User-Agent", UA)?;
+	let mut init = RequestInit::new();init.with_headers(h);
+	let mut r = Fetch::Request(Request::new_with_init(url, &init)?).send().await?;
 	if r.status_code() != 200 { return Err(format!("{url}: {}", r.status_code()).into()); }
 	r.bytes().await
 }
@@ -99,15 +102,17 @@ async fn fonts(s: &str) -> Vec<Vec<u8>> { // fallbacks for what noto serif can't
 	out
 }
 
-fn pic(m: &Message, text: bool) -> Option<String> { // first image: attachment, then embed image/thumb. asks media proxy for the exact size we draw
-	let a = m.attachments.iter().find(|a| a.content_type.as_deref().is_some_and(|t| t.starts_with("image/")) || (a.content_type.is_none() && a.width.is_some())).map(|a| (a.proxy_url.clone(), a.width, a.height));
-	let e = || m.embeds.iter().find_map(|e| e.image.as_ref().map(|i| (i.proxy_url.clone(), i.width, i.height)).or_else(|| e.thumbnail.as_ref().map(|t| (t.proxy_url.clone(), t.width, t.height)))).and_then(|(u, w, h)| Some((u?, w, h)));
-	let (u, w, h) = a.or_else(e)?;
-	let sep = if u.contains('?') { '&' } else { '?' };
-	Some(match (w, h) {
-		(Some(w), Some(h)) => { let (w, h) = card::fit_img(w as u32, h as u32, text); format!("{u}{sep}format=webp&width={w}&height={h}") }
-		_ => format!("{u}{sep}format=webp"),
-	})
+fn pic(m: &Message, text: bool) -> Vec<String> { // first image as urls to try: media proxy at the exact size we draw, then the original (proxy 403s workers sometimes)
+	let a = m.attachments.iter().find(|a| a.content_type.as_deref().is_some_and(|t| t.starts_with("image/")) || (a.content_type.is_none() && a.width.is_some())).map(|a| (Some(a.proxy_url.clone()), a.url.clone(), a.width, a.height));
+	let e = || m.embeds.iter().find_map(|e| e.image.as_ref().map(|i| (i.proxy_url.clone(), i.url.clone(), i.width, i.height)).or_else(|| e.thumbnail.as_ref().map(|t| (t.proxy_url.clone(), t.url.clone(), t.width, t.height))));
+	let Some((px, orig, w, h)) = a.or_else(e) else { return vec![] };
+	let mut out = vec![];
+	if let Some(u) = px {
+		let sep = if u.ends_with(['?', '&']) { "" } else if u.contains('?') { "&" } else { "?" };
+		out.push(match (w, h) { (Some(w), Some(h)) => { let (w, h) = card::fit_img(w as u32, h as u32, text);format!("{u}{sep}format=webp&width={w}&height={h}") } _ => format!("{u}{sep}format=webp") });
+	}
+	out.push(orig);
+	out
 }
 
 fn tag(t: &str) -> String { // inside <...>
@@ -151,7 +156,8 @@ fn avatar(m: &Message) -> String {
 async fn make(i: &Interaction, m: &Message) -> Result<()> {
 	let text = clean(m);
 	let av = gray(&avatar(m)).await;
-	let img = match pic(m, !text.trim().is_empty()) { Some(u) => { console_log!("pic {u}");gray(&u).await } None => None };
+	let mut img = None;
+	for u in pic(m, !text.trim().is_empty()) { console_log!("pic {u}");img = gray(&u).await;if img.is_some() { break; } }
 	let (name, user) = (m.author.global_name.clone().unwrap_or_else(|| m.author.name.clone()), format!("@{}", m.author.name));
 	let fb = fonts(&format!("{text}{name}{user}")).await;
 	let png = card::render(av.as_ref(), img.as_ref(), &text, &name, &user, &fb);
