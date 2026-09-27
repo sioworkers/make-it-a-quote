@@ -35,7 +35,7 @@ async fn interaction(mut req: Request, cx: &mods::Cx) -> Result<Response> {
 async fn fetch(req: Request, env: Env, wc: Context) -> Result<Response> {
 	match (req.method(), req.path().as_str()) {
 		(Method::Post, "/") => interaction(req, &mods::Cx { env, wc }).await,
-		(Method::Get, "/cmds") => Response::from_json(&mods::cmds()), // for CI to PUT to discord
+		(Method::Get, "/cmds") => Response::from_json(&mods::cmds()), // what this version registers
 		(Method::Get, "/") => web::home(&req, &env),
 		(Method::Get, "/done") => web::done(&req),
 		(Method::Get, "/style.css") => web::css(),
