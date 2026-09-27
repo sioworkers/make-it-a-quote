@@ -45,3 +45,12 @@ mods! {
 pub async fn dispatch(cx: &Cx, i: &Interaction, d: &CommandData) -> InteractionResponse {
 	run(cx, i, d).await.unwrap_or_else(|e| { console_error!("{}: {e}", d.name); reply("Something went wrong.") })
 }
+
+#[cfg(test)]
+mod tests {
+	#[test]
+	fn cmds_json() { // MIAQ_CMDS=file cargo test cmds_json -> json CI PUTs to discord
+		let c = serde_json::to_string(&super::cmds()).unwrap();
+		if let Ok(p) = std::env::var("MIAQ_CMDS") { std::fs::write(p, c).unwrap(); }
+	}
+}
