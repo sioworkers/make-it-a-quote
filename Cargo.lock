@@ -513,6 +513,7 @@ version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "ed25519-dalek",
+ "futures-util",
  "hex",
  "image",
  "serde_json",

@@ -1,6 +1,7 @@
 use super::{Cx, Mod, cmd, reply};
 use crate::card;
-use image::GrayImage;
+use futures_util::future::join_all;
+use image::{GrayImage, ImageReader};
 use serde_json::json;
 use twilight_model::{
 	application::{command::{Command, CommandType}, interaction::{Interaction, application_command::{CommandData, CommandOptionValue}}},
@@ -9,10 +10,12 @@ use twilight_model::{
 	id::{Id, marker::{ChannelMarker, MessageMarker}},
 };
 use twilight_util::builder::command::StringBuilder;
-use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Result, console_error, js_sys::Uint8Array};
+use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Result, Url, console_error, console_log, js_sys::Uint8Array};
 
 const API: &str = "https://discord.com/api/v10";
 const SRC: &str = "https://github.com/sioworkers/make-it-a-quote";
+const FB: &[&str] = &["Noto Sans Math", "Noto Emoji", "Noto Sans Symbols 2", "Noto Sans Symbols", "Noto Sans JP", "Noto Sans KR", "Noto Sans SC", "Noto Sans Arabic", "Noto Sans Hebrew", "Noto Sans Devanagari", "Noto Sans Thai"]; // fallback order
+const MAX_PX: u64 = 2_000_000; // decode cap, bigger = cpu limit
 
 pub struct Quote;
 
@@ -69,7 +72,31 @@ async fn fetch(url: &str) -> Result<Vec<u8>> {
 
 async fn gray(url: &str) -> Option<GrayImage> {
 	let b = fetch(url).await.map_err(|e| console_error!("img: {e}")).ok()?;
+	let r = ImageReader::new(std::io::Cursor::new(&b)).with_guessed_format().ok()?;
+	let (w, h) = r.into_dimensions().map_err(|e| console_error!("img dims: {e}")).ok()?;
+	if w as u64 * h as u64 > MAX_PX { console_error!("img too big: {w}x{h} {url}");return None; }
 	image::load_from_memory(&b).map(|i| i.to_luma8()).map_err(|e| console_error!("img decode: {e}")).ok()
+}
+
+async fn gfont(fam: &str, text: &str) -> Option<Vec<u8>> { // google fonts subset w/ only these chars, old UA gets ttf
+	let u = Url::parse_with_params("https://fonts.googleapis.com/css2", [("family", fam), ("text", text)]).ok()?;
+	let h = Headers::new();h.set("User-Agent", "Wget/1.21").ok()?;
+	let mut init = RequestInit::new();init.with_headers(h);
+	let css = Fetch::Request(Request::new_with_init(u.as_str(), &init).ok()?).send().await.ok()?.text().await.ok()?;
+	fetch(css.split("url(").nth(1)?.split(')').next()?).await.ok()
+}
+
+async fn fonts(s: &str) -> Vec<Vec<u8>> { // fallbacks for what noto serif can't draw
+	let need = card::missing(s);
+	if need.is_empty() { return vec![]; }
+	let (mut left, mut out) = (need.clone(), vec![]);
+	for b in join_all(FB.iter().map(|f| gfont(f, &need))).await.into_iter().flatten() {
+		let l = card::lacks(&b, &left);
+		if l.chars().count() < left.chars().count() { out.push(b);left = l; }
+		if left.is_empty() { break; }
+	}
+	if !left.is_empty() { console_log!("no font for {:?}", left); }
+	out
 }
 
 fn pic(m: &Message, text: bool) -> Option<String> { // first image: attachment, then embed image/thumb. asks media proxy for the exact size we draw
@@ -78,8 +105,8 @@ fn pic(m: &Message, text: bool) -> Option<String> { // first image: attachment, 
 	let (u, w, h) = a.or_else(e)?;
 	let sep = if u.contains('?') { '&' } else { '?' };
 	Some(match (w, h) {
-		(Some(w), Some(h)) => { let (w, h) = card::fit_img(w as u32, h as u32, text); format!("{u}{sep}format=png&width={w}&height={h}") }
-		_ => format!("{u}{sep}format=png"),
+		(Some(w), Some(h)) => { let (w, h) = card::fit_img(w as u32, h as u32, text); format!("{u}{sep}format=webp&width={w}&height={h}") }
+		_ => format!("{u}{sep}format=webp"),
 	})
 }
 
@@ -113,20 +140,21 @@ fn clean(m: &Message) -> String { // discord markup -> plain text
 	}
 	o += rest;
 	let o: Vec<String> = o.lines().map(|l| { let l = l.trim_start(); l.trim_start_matches("-# ").trim_start_matches(['#', '>']).trim_start().to_string() }).collect();
-	o.join("\n").replace("**", "").replace("__", "").replace("~~", "").replace("||", "").replace('`', "").chars().filter(|&c| card::known(c)).collect()
+	o.join("\n").replace("**", "").replace("__", "").replace("~~", "").replace("||", "").replace('`', "")
 }
 
 fn avatar(m: &Message) -> String {
 	let u = &m.author;
-	match u.avatar { Some(h) => format!("https://cdn.discordapp.com/avatars/{}/{h}.png?size=256", u.id), None => format!("https://cdn.discordapp.com/embed/avatars/{}.png", (u.id.get() >> 22) % 6) }
+	match u.avatar { Some(h) => format!("https://cdn.discordapp.com/avatars/{}/{h}.png?size=512", u.id), None => format!("https://cdn.discordapp.com/embed/avatars/{}.png", (u.id.get() >> 22) % 6) }
 }
 
 async fn make(i: &Interaction, m: &Message) -> Result<()> {
 	let text = clean(m);
 	let av = gray(&avatar(m)).await;
-	let img = match pic(m, !text.trim().is_empty()) { Some(u) => gray(&u).await, None => None };
-	let name = m.author.global_name.clone().unwrap_or_else(|| m.author.name.clone());
-	let png = card::render(av.as_ref(), img.as_ref(), &text, &name, &format!("@{}", m.author.name));
+	let img = match pic(m, !text.trim().is_empty()) { Some(u) => { console_log!("pic {u}");gray(&u).await } None => None };
+	let (name, user) = (m.author.global_name.clone().unwrap_or_else(|| m.author.name.clone()), format!("@{}", m.author.name));
+	let fb = fonts(&format!("{text}{name}{user}")).await;
+	let png = card::render(av.as_ref(), img.as_ref(), &text, &name, &user, &fb);
 	let g = i.guild_id.map_or("@me".into(), |g| g.to_string());
 	edit(i, &format!("-# [Jump to message](<https://discord.com/channels/{g}/{}/{}>) | [Source](<{SRC}>)", m.channel_id, m.id), Some(png)).await
 }

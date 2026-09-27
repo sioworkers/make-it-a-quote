@@ -11,8 +11,10 @@
 * { box-sizing: border-box; }
 html { background: var(--bg); color: var(--fg); -webkit-text-size-adjust: 100%; }
 body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; font: 16px/1.6 ui-sans-serif, system-ui, sans-serif; }
-main { flex: 1; width: 100%; max-width: 40rem; margin: 0 auto; padding: 6rem 1rem 3rem; }
-.logo { display: block; width: 3.875rem; height: auto; margin-bottom: 1.75rem; }
+main { flex: 1; width: 100%; max-width: 40rem; margin: 0 auto; padding: 4rem 1rem 3rem; }
+.bar { width: 100%; max-width: 40rem; margin: 0 auto; padding: 1.25rem 1rem; }
+.bar a { display: inline-block; border-radius: .4rem; }
+.bar img { display: block; width: 2.25rem; height: auto; }
 h1 { margin: 0 0 .5rem; font-size: 2.5rem; letter-spacing: -.02em; }
 p { color: var(--dim); margin: 0 0 1rem; }
 .lead { color: var(--fg); font-size: 1.15rem; }
@@ -25,7 +27,7 @@ p { color: var(--dim); margin: 0 0 1rem; }
 footer { max-width: 40rem; width: 100%; margin: 0 auto; padding: 1.5rem 1rem; border-top: 1px solid var(--line); font-size: .9rem; display: flex; flex-wrap: wrap; gap: 1.25rem; }
 footer a { color: var(--dim); }
 footer a:hover { color: var(--fg); }
-.doc { padding-top: 4rem; }
+.doc { padding-top: 2.5rem; }
 .doc h1 { font-size: 2rem; }
 .doc h2 { margin: 2rem 0 .5rem; font-size: 1.15rem; }
 .doc ul { color: var(--dim); margin: 0 0 1rem; padding-left: 1.25rem; }

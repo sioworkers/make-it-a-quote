@@ -1,4 +1,4 @@
-use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
+use ab_glyph::{Font, FontRef, GlyphId, PxScale, ScaleFont, point};
 use image::{GrayImage, ImageEncoder, codecs::png::{CompressionType, FilterType as PngFilter, PngEncoder}};
 
 pub const W: u32 = 1200;
@@ -14,6 +14,36 @@ static REG: &[u8] = include_bytes!("../assets/serif.ttf");
 static ITA: &[u8] = include_bytes!("../assets/serif-i.ttf");
 
 type Bm = (i32, i32, u32, Vec<u8>); // off x, off y, w, coverage
+
+struct Fs<'a>(Vec<FontRef<'a>>); // 0 reg, 1 ita, 2.. fallbacks
+
+impl Fs<'_> {
+	fn pick(&self, fi: usize, c: char) -> Option<(usize, GlyphId)> { // wanted font, then fallbacks, then reg
+		[fi].into_iter().chain(2..self.0.len()).chain([0]).map(|i| (i, self.0[i].glyph_id(c))).find(|(_, g)| g.0 != 0)
+	}
+
+	fn walk(&self, fi: usize, px: f32, s: &str, mut f: impl FnMut(usize, GlyphId, f32)) -> f32 { // x of each glyph, returns width. kern only within one font
+		let (mut x, mut prev) = (0., None::<(usize, GlyphId)>);
+		for c in s.chars() {
+			let Some((i, g)) = self.pick(fi, c) else { continue };
+			let sf = self.0[i].as_scaled(PxScale::from(px));
+			if let Some((pi, pg)) = prev && pi == i { x += sf.kern(pg, g); }
+			f(i, g, x);x += sf.h_advance(g);prev = Some((i, g));
+		}
+		x
+	}
+}
+
+fn ignorable(c: char) -> bool { c.is_whitespace() || c.is_control() || matches!(c, '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0000}'..='\u{E007F}') }
+
+pub fn lacks(font: &[u8], s: &str) -> String { // chars in s this font can't draw, deduped
+	let Ok(f) = FontRef::try_from_slice(font) else { return String::new() };
+	let mut out = String::new();
+	for c in s.chars() { if !ignorable(c) && f.glyph_id(c).0 == 0 && !out.contains(c) { out.push(c); } }
+	out
+}
+
+pub fn missing(s: &str) -> String { lacks(REG, s) }
 
 struct Cv(Vec<u8>, std::collections::HashMap<(u8, u16, u32), Option<Bm>>); // px, glyph cache by (font, glyph, px)
 
@@ -31,51 +61,44 @@ impl Cv {
 		}
 	}
 
-	fn line<F: Font>(&mut self, fi: u8, f: &F, px: f32, s: &str, base: f32, v: f32) { // centered in text area, glyphs snapped to whole px so they can be cached
-		let sf = f.as_scaled(PxScale::from(px));
-		let (mut cx, mut prev) = (TX + (TW - width(f, px, s)) / 2., None);
-		for c in s.chars() {
-			let id = sf.glyph_id(c);
-			if let Some(p) = prev { cx += sf.kern(p, id); }
-			let (gx, gy) = (cx.round() as i32, base.round() as i32);
-			cx += sf.h_advance(id);prev = Some(id);
-			let bm = self.1.entry((fi, id.0, px.to_bits())).or_insert_with(|| {
-				let o = f.outline_glyph(id.with_scale_and_position(px, point(0., 0.)))?;
+	fn line(&mut self, fs: &Fs, fi: usize, px: f32, s: &str, base: f32, v: f32) { // centered in text area, glyphs snapped to whole px so they can be cached
+		let x0 = TX + (TW - width(fs, fi, px, s)) / 2.;
+		let mut gs = vec![];fs.walk(fi, px, s, |i, g, x| gs.push((i, g, x)));
+		for (i, g, x) in gs {
+			let (gx, gy) = ((x0 + x).round() as i32, base.round() as i32);
+			let k = (i as u8, g.0, px.to_bits());
+			let bm = self.1.entry(k).or_insert_with(|| {
+				let o = fs.0[i].outline_glyph(g.with_scale_and_position(px, point(0., 0.)))?;
 				let b = o.px_bounds();let w = b.width() as u32;
 				let mut cov = vec![0u8; (w * b.height() as u32) as usize];
 				o.draw(|x, y, a| cov[(y * w + x) as usize] = (a.min(1.) * 255.) as u8);
 				Some((b.min.x as i32, b.min.y as i32, w, cov))
 			}).take();
 			let Some((ox, oy, w, cov)) = bm else { continue };
-			let mut i = 0;while i < cov.len() {
-				if cov[i] > 0 { self.put(gx + ox + (i as u32 % w) as i32, gy + oy + (i as u32 / w) as i32, v, cov[i] as f32 / 255.); }
-				i += 1;
+			let mut j = 0;while j < cov.len() {
+				if cov[j] > 0 { self.put(gx + ox + (j as u32 % w) as i32, gy + oy + (j as u32 / w) as i32, v, cov[j] as f32 / 255.); }
+				j += 1;
 			}
-			self.1.insert((fi, id.0, px.to_bits()), Some((ox, oy, w, cov)));
+			self.1.insert(k, Some((ox, oy, w, cov)));
 		}
 	}
 }
 
-fn width<F: Font>(f: &F, px: f32, s: &str) -> f32 {
-	let sf = f.as_scaled(PxScale::from(px));
-	let (mut w, mut prev) = (0., None);
-	for c in s.chars() { let id = sf.glyph_id(c); if let Some(p) = prev { w += sf.kern(p, id); } w += sf.h_advance(id);prev = Some(id); }
-	w
-}
+fn width(fs: &Fs, fi: usize, px: f32, s: &str) -> f32 { fs.walk(fi, px, s, |_, _, _| {}) }
 
-fn wrap<F: Font>(f: &F, px: f32, s: &str, max: f32) -> Vec<String> { // greedy, breaks long words by char, word widths summed (no kern across spaces)
-	let sp = width(f, px, " ");
+fn wrap(fs: &Fs, fi: usize, px: f32, s: &str, max: f32) -> Vec<String> { // greedy, breaks long words by char, word widths summed (no kern across spaces)
+	let sp = width(fs, fi, px, " ");
 	let mut out = vec![];
 	for para in s.split('\n') {
 		let (mut cur, mut cw) = (String::new(), 0.);
 		for w in para.split_whitespace() {
-			let ww = width(f, px, w);
+			let ww = width(fs, fi, px, w);
 			if cur.is_empty() && ww <= max { cur = w.into();cw = ww;continue; }
 			if !cur.is_empty() && cw + sp + ww <= max { cur.push(' ');cur += w;cw += sp + ww;continue; }
 			if !cur.is_empty() { out.push(std::mem::take(&mut cur));cw = 0.; }
 			if ww <= max { cur = w.into();cw = ww;continue; }
 			for c in w.chars() { // too long for a line
-				let c_w = width(f, px, c.encode_utf8(&mut [0; 4]));
+				let c_w = width(fs, fi, px, c.encode_utf8(&mut [0; 4]));
 				if cw + c_w > max && !cur.is_empty() { out.push(std::mem::take(&mut cur));cw = 0.; }
 				cur.push(c);cw += c_w;
 			}
@@ -86,14 +109,12 @@ fn wrap<F: Font>(f: &F, px: f32, s: &str, max: f32) -> Vec<String> { // greedy, 
 	out
 }
 
-fn fit<F: Font>(f: &F, px: f32, s: &str, max: f32) -> String { // cut + ... to one line
-	if width(f, px, s) <= max { return s.into(); }
+fn fit(fs: &Fs, fi: usize, px: f32, s: &str, max: f32) -> String { // cut + ... to one line
+	if width(fs, fi, px, s) <= max { return s.into(); }
 	let mut t: String = s.into();
-	while !t.is_empty() && width(f, px, &format!("{t}...")) > max { t.pop(); }
+	while !t.is_empty() && width(fs, fi, px, &format!("{t}...")) > max { t.pop(); }
 	format!("{}...", t.trim_end())
 }
-
-pub fn known(c: char) -> bool { c.is_whitespace() || FontRef::try_from_slice(REG).is_ok_and(|f| f.glyph_id(c).0 != 0) }
 
 pub fn fit_img(w: u32, h: u32, text: bool) -> (u32, u32) { // scale down into img box, keep ratio
 	let (bw, bh) = (IMG_W as f32, if text { IMG_H_TXT } else { IMG_H } as f32);
@@ -135,8 +156,8 @@ fn avatar(cv: &mut Cv, a: &GrayImage) { // bilinear to HxH at x=0, fixed point, 
 	}
 }
 
-pub fn render(av: Option<&GrayImage>, img: Option<&GrayImage>, text: &str, name: &str, user: &str) -> Vec<u8> {
-	let (reg, ita) = (FontRef::try_from_slice(REG).unwrap(), FontRef::try_from_slice(ITA).unwrap()); // bundled, can't fail
+pub fn render(av: Option<&GrayImage>, img: Option<&GrayImage>, text: &str, name: &str, user: &str, fb: &[Vec<u8>]) -> Vec<u8> { // fb = extra fonts for chars noto serif lacks
+	let fs = Fs([REG, ITA].into_iter().chain(fb.iter().map(|b| &b[..])).filter_map(|b| FontRef::try_from_slice(b).ok()).collect()); // bundled 2 can't fail
 	let mut cv = Cv(vec![0; (W * H) as usize], Default::default());
 	if let Some(a) = av {
 		avatar(&mut cv, a);
@@ -149,27 +170,27 @@ pub fn render(av: Option<&GrayImage>, img: Option<&GrayImage>, text: &str, name:
 	let room = H as f32 - PAD * 2. - foot - 32. - ih;
 	let (mut px, mut lines) = (64., vec![]);
 	while !text.is_empty() {
-		lines = wrap(&reg, px, text, TW);
+		lines = wrap(&fs, 0, px, text, TW);
 		if lines.len() as f32 * px * 1.3 <= room || px <= 22. { break; }
 		px -= 2.;
 	}
 	let max = (room / (px * 1.3)).floor().max(1.) as usize;
-	if lines.len() > max { lines.truncate(max);let l = lines.pop().unwrap_or_default();lines.push(fit(&reg, px, &format!("{l}..."), TW)); }
+	if lines.len() > max { lines.truncate(max);let l = lines.pop().unwrap_or_default();lines.push(fit(&fs, 0, px, &format!("{l}..."), TW)); }
 	let th = lines.len() as f32 * px * 1.3;
 	let total = ih + th + if text.is_empty() { 0. } else { 32. } + foot;
 	let mut y = ((H as f32 - total) / 2.).max(PAD);
 	if let Some(i) = &img { cv.img(i, (TX + (TW - i.width() as f32) / 2.) as i32, y as i32);y += ih; }
 	for l in &lines {
 		let lh = px * 1.3;
-		cv.line(0, &reg, px, l, y + lh * 0.78, 255.);
+		cv.line(&fs, 0, px, l, y + lh * 0.78, 255.);
 		y += lh;
 	}
 	if !text.is_empty() { y += 32.; }
-	let n = fit(&ita, np, &format!("- {name}"), TW);
-	cv.line(1, &ita, np, &n, y + np * 1.3 * 0.78, 235.);
+	let n = fit(&fs, 1, np, &format!("- {name}"), TW);
+	cv.line(&fs, 1, np, &n, y + np * 1.3 * 0.78, 235.);
 	y += np * 1.3 + 8.;
-	let u = fit(&reg, up, user, TW);
-	cv.line(0, &reg, up, &u, y + up * 1.3 * 0.78, 130.);
+	let u = fit(&fs, 0, up, user, TW);
+	cv.line(&fs, 0, up, &u, y + up * 1.3 * 0.78, 130.);
 	let mut out = vec![];
 	let _ = PngEncoder::new_with_quality(&mut out, CompressionType::Fast, PngFilter::Sub).write_image(&cv.0, W, H, image::ExtendedColorType::L8);
 	out
@@ -185,9 +206,12 @@ mod tests {
 		let pic = GrayImage::from_fn(800, 600, |x, _| image::Luma([(x / 4) as u8]));
 		let long = "the quick brown fox jumps over the lazy dog ".repeat(30);
 		let cases: [(&str, Option<&GrayImage>, &str); 4] = [("short", None, "never gonna give you up"), ("long", None, &long), ("img", Some(&pic), "look at this"), ("only_img", Some(&pic), "")];
+		let fb: Vec<Vec<u8>> = std::env::var("MIAQ_FB").map(|v| v.split(',').filter_map(|p| std::fs::read(p).ok()).collect()).unwrap_or_default(); // MIAQ_FB=a.ttf,b.ttf
+		let name = if fb.is_empty() { "Some Person" } else { "𝐁𝐮𝐭𝐭𝐞𝐫𝐃𝐞𝐯 𝟐.𝟏 😀" };
+		assert!(!missing(name).contains('B') && missing("𝐁 x").chars().count() == 1);
 		for (n, im, t) in cases {
 			let t0 = std::time::Instant::now();
-			let png = render(Some(&av), im, t, "Some Person", "@someone");
+			let png = render(Some(&av), im, t, name, "@someone", &fb);
 			eprintln!("{n}: {:?} {}KB", t0.elapsed(), png.len() / 1024);
 			assert_eq!(&png[1..4], b"PNG");
 			if let Ok(d) = std::env::var("MIAQ_OUT") { std::fs::write(format!("{d}/{n}.png"), png).unwrap(); }
