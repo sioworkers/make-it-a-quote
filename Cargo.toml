@@ -12,8 +12,9 @@ crate-type = ["cdylib"]
 ab_glyph = "0.2"
 ed25519-dalek = "3"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+gif = "0.14"
 hex = "0.4"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 serde_json = "1"
 twilight-model = "0.17"
 twilight-util = { version = "0.17", features = ["builder"] }

@@ -9,6 +9,9 @@ const PAD: f32 = 56.; // top/bottom
 pub const IMG_W: u32 = 500;
 pub const IMG_H: u32 = 380; // w/o text
 const IMG_H_TXT: u32 = 240; // w/ text
+const MAXF: usize = 150; // gif frames decoded at most
+const OUTF: usize = 40; // gif frames written at most, rest dropped evenly
+const GIF_PX: u64 = 8_000_000; // decode budget, frames * w * h
 
 static REG: &[u8] = include_bytes!("../assets/serif.ttf");
 static ITA: &[u8] = include_bytes!("../assets/serif-i.ttf");
@@ -122,25 +125,31 @@ pub fn fit_img(w: u32, h: u32, text: bool) -> (u32, u32) { // scale down into im
 	(((w as f32 * k) as u32).max(1), ((h as f32 * k) as u32).max(1))
 }
 
-fn scale(im: &GrayImage, w: u32, h: u32) -> GrayImage { // bilinear
+fn axis(s: usize, n: usize) -> Vec<(usize, usize, u32)> { // bilinear taps per dst px: src i, i+1, weight/256
+	(0..n).map(|d| { let f = ((d as f32 + 0.5) * s as f32 / n as f32 - 0.5).clamp(0., s as f32 - 1.);let i = f as usize;(i, (i + 1).min(s - 1), ((f - i as f32) * 256.) as u32) }).collect()
+}
+
+fn scale(im: &GrayImage, w: u32, h: u32) -> GrayImage { // bilinear, fixed point
 	if im.dimensions() == (w, h) { return im.clone(); }
-	let (sw, sh) = (im.width() as f32, im.height() as f32);
-	let (kx, ky) = (sw / w as f32, sh / h as f32);
-	let src = im.as_raw();
-	let at = |x: usize, y: usize| src[y * im.width() as usize + x] as f32;
-	GrayImage::from_fn(w, h, |x, y| {
-		let (fx, fy) = (((x as f32 + 0.5) * kx - 0.5).clamp(0., sw - 1.), ((y as f32 + 0.5) * ky - 0.5).clamp(0., sh - 1.));
-		let (x0, y0) = (fx as usize, fy as usize);let (x1, y1) = ((x0 + 1).min(sw as usize - 1), (y0 + 1).min(sh as usize - 1));
-		let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
-		let top = at(x0, y0) * (1. - tx) + at(x1, y0) * tx;let bot = at(x0, y1) * (1. - tx) + at(x1, y1) * tx;
-		image::Luma([(top * (1. - ty) + bot * ty) as u8])
-	})
+	let (sw, sh, w, h) = (im.width() as usize, im.height() as usize, w as usize, h as usize);
+	let (xs, ys, src) = (axis(sw, w), axis(sh, h), im.as_raw());
+	let mut out = vec![0u8; w * h];
+	let mut y = 0;while y < h {
+		let (y0, y1, ty) = ys[y];let (r0, r1) = (&src[y0 * sw..][..sw], &src[y1 * sw..][..sw]);
+		let mut x = 0;while x < w {
+			let (x0, x1, tx) = xs[x];
+			let top = r0[x0] as u32 * (256 - tx) + r0[x1] as u32 * tx;let bot = r1[x0] as u32 * (256 - tx) + r1[x1] as u32 * tx;
+			out[y * w + x] = ((top * (256 - ty) + bot * ty) >> 16) as u8;
+			x += 1;
+		}
+		y += 1;
+	}
+	GrayImage::from_raw(w as u32, h as u32, out).unwrap_or_default()
 }
 
 fn avatar(cv: &mut Cv, a: &GrayImage) { // bilinear to HxH at x=0, fixed point, fused w/ smoothstep fade to black
 	let (sw, sh, n) = (a.width() as usize, a.height() as usize, H as usize);
-	let axis = |s: usize| -> Vec<(usize, usize, u32)> { (0..n).map(|d| { let f = ((d as f32 + 0.5) * s as f32 / n as f32 - 0.5).clamp(0., s as f32 - 1.);let i = f as usize;(i, (i + 1).min(s - 1), ((f - i as f32) * 256.) as u32) }).collect() };
-	let (xs, ys) = (axis(sw), axis(sh));
+	let (xs, ys) = (axis(sw, n), axis(sh, n));
 	let fade: Vec<u32> = (0..n).map(|x| { let t = ((x as f32 - 200.) / 430.).clamp(0., 1.);((1. - t * t * (3. - 2. * t)) * 256.) as u32 }).collect();
 	let src = a.as_raw();
 	let mut y = 0;while y < n {
@@ -156,7 +165,9 @@ fn avatar(cv: &mut Cv, a: &GrayImage) { // bilinear to HxH at x=0, fixed point, 
 	}
 }
 
-pub fn render(av: Option<&GrayImage>, img: Option<&GrayImage>, text: &str, name: &str, user: &str, fb: &[Vec<u8>]) -> Vec<u8> { // fb = extra fonts for chars noto serif lacks
+type Rect = (u32, u32, u32, u32); // x, y, w, h
+
+fn compose(av: Option<&GrayImage>, img: Option<&GrayImage>, text: &str, name: &str, user: &str, fb: &[Vec<u8>]) -> (Vec<u8>, Option<Rect>) { // fb = extra fonts for chars noto serif lacks
 	let fs = Fs([REG, ITA].into_iter().chain(fb.iter().map(|b| &b[..])).filter_map(|b| FontRef::try_from_slice(b).ok()).collect()); // bundled 2 can't fail
 	let mut cv = Cv(vec![0; (W * H) as usize], Default::default());
 	if let Some(a) = av {
@@ -179,7 +190,8 @@ pub fn render(av: Option<&GrayImage>, img: Option<&GrayImage>, text: &str, name:
 	let th = lines.len() as f32 * px * 1.3;
 	let total = ih + th + if text.is_empty() { 0. } else { 32. } + foot;
 	let mut y = ((H as f32 - total) / 2.).max(PAD);
-	if let Some(i) = &img { cv.img(i, (TX + (TW - i.width() as f32) / 2.) as i32, y as i32);y += ih; }
+	let mut rect = None;
+	if let Some(i) = &img { let x = (TX + (TW - i.width() as f32) / 2.) as u32;cv.img(i, x as i32, y as i32);rect = Some((x, y as u32, i.width(), i.height()));y += ih; }
 	for l in &lines {
 		let lh = px * 1.3;
 		cv.line(&fs, 0, px, l, y + lh * 0.78, 255.);
@@ -191,8 +203,68 @@ pub fn render(av: Option<&GrayImage>, img: Option<&GrayImage>, text: &str, name:
 	y += np * 1.3 + 8.;
 	let u = fit(&fs, 0, up, user, TW);
 	cv.line(&fs, 0, up, &u, y + up * 1.3 * 0.78, 130.);
+	(cv.0, rect)
+}
+
+pub fn render(av: Option<&GrayImage>, img: Option<&GrayImage>, text: &str, name: &str, user: &str, fb: &[Vec<u8>]) -> Vec<u8> {
+	let (px, _) = compose(av, img, text, name, user, fb);
 	let mut out = vec![];
-	let _ = PngEncoder::new_with_quality(&mut out, CompressionType::Fast, PngFilter::Sub).write_image(&cv.0, W, H, image::ExtendedColorType::L8);
+	let _ = PngEncoder::new_with_quality(&mut out, CompressionType::Fast, PngFilter::Sub).write_image(&px, W, H, image::ExtendedColorType::L8);
+	out
+}
+
+fn lut(p: &[u8]) -> [u8; 256] { // palette rgb -> gray
+	let mut l = [0u8; 256];
+	for (i, c) in p.as_chunks::<3>().0.iter().take(256).enumerate() { l[i] = ((c[0] as u32 * 299 + c[1] as u32 * 587 + c[2] as u32 * 114) / 1000) as u8; }
+	l
+}
+
+pub fn frames(b: &[u8]) -> Vec<(GrayImage, u16)> { // composited gif frames as gray + delay in 1/100s, capped then thinned to OUTF
+	let mut o = gif::DecodeOptions::new();o.set_color_output(gif::ColorOutput::Indexed);
+	let Ok(mut d) = o.read_info(std::io::Cursor::new(b)) else { return vec![] };
+	let (w, h) = (d.width() as usize, d.height() as usize);
+	let glob = d.global_palette().map(lut).unwrap_or([0; 256]);
+	let (mut cv, mut out, mut px) = (vec![0u8; w * h], vec![], 0u64);
+	while let Ok(Some(f)) = d.read_next_frame() {
+		let l = f.palette.as_deref().map(lut).unwrap_or(glob);
+		let (fx, fy, fw, fh) = (f.left as usize, f.top as usize, f.width as usize, f.height as usize);
+		let prev = (f.dispose == gif::DisposalMethod::Previous).then(|| cv.clone());
+		let mut y = 0;while y < fh {
+			if fy + y < h {
+				let row = &f.buffer[y * fw..][..fw];
+				let mut x = 0;while x < fw && fx + x < w { let i = row[x];if f.transparent != Some(i) { cv[(fy + y) * w + fx + x] = l[i as usize]; } x += 1; }
+			}
+			y += 1;
+		}
+		out.push((GrayImage::from_raw(w as u32, h as u32, cv.clone()).unwrap_or_default(), if f.delay < 2 { 10 } else { f.delay })); // <2 = browsers use 10
+		match (f.dispose, prev) {
+			(gif::DisposalMethod::Background, _) => { let mut y = fy;while y < (fy + fh).min(h) { let e = (fx + fw).min(w);if fx < e { cv[y * w + fx..y * w + e].fill(0); } y += 1; } }
+			(gif::DisposalMethod::Previous, Some(p)) => cv = p,
+			_ => {}
+		}
+		px += (w * h) as u64;
+		if out.len() >= MAXF || px >= GIF_PX { break; }
+	}
+	if out.len() <= OUTF { return out; }
+	let k = out.len().div_ceil(OUTF);
+	out.chunks(k).map(|c| (c[0].0.clone(), c.iter().map(|f| f.1).sum())).collect()
+}
+
+pub fn render_gif(av: Option<&GrayImage>, fr: &[(GrayImage, u16)], text: &str, name: &str, user: &str, fb: &[Vec<u8>]) -> Vec<u8> { // frame 0 = whole card, rest only redraw the gif rect
+	let (base, rect) = compose(av, fr.first().map(|f| &f.0), text, name, user, fb);
+	let pal: Vec<u8> = (0..=255u8).flat_map(|v| [v, v, v]).collect(); // index = gray, no quantizing
+	let mut out = vec![];
+	{
+		let Ok(mut e) = gif::Encoder::new(&mut out, W as u16, H as u16, &pal) else { return out };
+		let _ = e.set_repeat(gif::Repeat::Infinite);
+		let _ = e.write_frame(&gif::Frame { width: W as u16, height: H as u16, buffer: base.into(), delay: fr.first().map_or(10, |f| f.1), dispose: gif::DisposalMethod::Keep, ..Default::default() });
+		if let Some((x, y, w, h)) = rect {
+			for f in fr.iter().skip(1) {
+				let s = scale(&f.0, w, h);
+				let _ = e.write_frame(&gif::Frame { left: x as u16, top: y as u16, width: w as u16, height: h as u16, buffer: s.into_raw().into(), delay: f.1, dispose: gif::DisposalMethod::Keep, ..Default::default() });
+			}
+		}
+	}
 	out
 }
 
@@ -215,6 +287,17 @@ mod tests {
 			eprintln!("{n}: {:?} {}KB", t0.elapsed(), png.len() / 1024);
 			assert_eq!(&png[1..4], b"PNG");
 			if let Ok(d) = std::env::var("MIAQ_OUT") { std::fs::write(format!("{d}/{n}.png"), png).unwrap(); }
+		}
+		if let Ok(g) = std::env::var("MIAQ_GIF") { // MIAQ_GIF=a.gif,b.gif
+			for (k, p) in g.split(',').enumerate() {
+				let b = std::fs::read(p).unwrap();
+				let t0 = std::time::Instant::now();
+				let fr = frames(&b);let t1 = t0.elapsed();
+				let out = render_gif(Some(&av), &fr, if k == 0 { "" } else { "when the cat" }, name, "@someone", &fb);
+				eprintln!("gif{k}: {} frames, decode {t1:?}, total {:?}, {}KB", fr.len(), t0.elapsed(), out.len() / 1024);
+				assert_eq!(&out[..3], b"GIF");
+				if let Ok(d) = std::env::var("MIAQ_OUT") { std::fs::write(format!("{d}/gif{k}.gif"), out).unwrap(); }
+			}
 		}
 	}
 }

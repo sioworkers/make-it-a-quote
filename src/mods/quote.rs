@@ -115,6 +115,26 @@ fn pic(m: &Message, text: bool) -> Vec<String> { // first image as urls to try: 
 	out
 }
 
+fn gif_src(m: &Message) -> Option<String> { // animated source: gif upload, tenor/giphy embed, or direct .gif link
+	if let Some(a) = m.attachments.iter().find(|a| a.content_type.as_deref() == Some("image/gif") || a.filename.to_lowercase().ends_with(".gif")) { return Some(a.url.clone()); }
+	m.embeds.iter().find_map(|e| {
+		let urls: Vec<&str> = [e.video.as_ref().and_then(|v| v.url.as_deref()), e.thumbnail.as_ref().map(|t| t.url.as_str()), e.image.as_ref().map(|i| i.url.as_str()), e.url.as_deref()].into_iter().flatten().collect();
+		urls.iter().find_map(|u| tenor(u).or_else(|| giphy(u))).or_else(|| urls.iter().find(|u| u.split(['?', '#']).next().is_some_and(|p| p.to_lowercase().ends_with(".gif"))).map(|u| u.to_string()))
+	})
+}
+
+fn tenor(u: &str) -> Option<String> { // media.tenor.com/{11 id}{5 fmt}/{slug}.{ext} -> AAAAM = medium gif
+	let p = u.split("media.tenor.com/").nth(1)?;let mut it = p.split('/');
+	let (id, slug) = (it.next()?, it.next()?.split(['?', '.']).next()?);
+	(id.len() == 16).then(|| format!("https://media.tenor.com/{}AAAAM/{slug}.gif", &id[..11]))
+}
+
+fn giphy(u: &str) -> Option<String> { // media*.giphy.com/media/{id}/... -> 200px tall gif
+	if !u.contains("giphy.com/media/") { return None; }
+	let id = u.split("/media/").nth(1)?.split('/').next()?;
+	Some(format!("https://media.giphy.com/media/{id}/200.gif"))
+}
+
 fn tag(t: &str) -> String { // inside <...>
 	if let Some(e) = t.strip_prefix("a:").or_else(|| t.strip_prefix(':')) { return format!(":{}:", e.split(':').next().unwrap_or_default()); }
 	if t.starts_with("@&") { return "@role".into(); }
@@ -154,24 +174,32 @@ fn avatar(m: &Message) -> String {
 }
 
 async fn make(i: &Interaction, m: &Message) -> Result<()> {
-	let text = clean(m);
+	let mut text = clean(m);
+	let link_only = !m.embeds.is_empty() && m.attachments.is_empty() && !text.trim().contains(char::is_whitespace) && text.trim().starts_with("http");
+	if link_only { text.clear(); } // the link is the image, don't also print it
 	let av = gray(&avatar(m)).await;
-	let mut img = None;
-	for u in pic(m, !text.trim().is_empty()) { console_log!("pic {u}");img = gray(&u).await;if img.is_some() { break; } }
 	let (name, user) = (m.author.global_name.clone().unwrap_or_else(|| m.author.name.clone()), format!("@{}", m.author.name));
 	let fb = fonts(&format!("{text}{name}{user}")).await;
-	let png = card::render(av.as_ref(), img.as_ref(), &text, &name, &user, &fb);
+	let mut fr = vec![];
+	if let Some(u) = gif_src(m) { console_log!("gif {u}");if let Ok(b) = fetch(&u).await.map_err(|e| console_error!("gif: {e}")) { fr = card::frames(&b); } }
+	let file = if fr.len() > 1 {
+		(card::render_gif(av.as_ref(), &fr, &text, &name, &user, &fb), "quote.gif", "image/gif")
+	} else {
+		let mut img = fr.pop().map(|f| f.0);
+		for u in pic(m, !text.trim().is_empty()) { if img.is_some() { break; } console_log!("pic {u}");img = gray(&u).await; }
+		(card::render(av.as_ref(), img.as_ref(), &text, &name, &user, &fb), "quote.png", "image/png")
+	};
 	let g = i.guild_id.map_or("@me".into(), |g| g.to_string());
-	edit(i, &format!("-# [Jump to message](<https://discord.com/channels/{g}/{}/{}>) | [Source](<{SRC}>)", m.channel_id, m.id), Some(png)).await
+	edit(i, &format!("-# [Jump to message](<https://discord.com/channels/{g}/{}/{}>) | [Source](<{SRC}>)", m.channel_id, m.id), Some(file)).await
 }
 
-async fn edit(i: &Interaction, s: &str, png: Option<Vec<u8>>) -> Result<()> { // PATCH @original, multipart when there's a file
-	let files = if png.is_some() { json!([{ "id": 0, "filename": "quote.png" }]) } else { json!([]) };
+async fn edit(i: &Interaction, s: &str, file: Option<(Vec<u8>, &str, &str)>) -> Result<()> { // PATCH @original, multipart when there's a file (bytes, name, mime)
+	let files = match &file { Some((_, n, _)) => json!([{ "id": 0, "filename": n }]), None => json!([]) };
 	let pay = json!({ "content": s, "allowed_mentions": { "parse": [] }, "attachments": files }).to_string();
 	let b = "miaqmiaqmiaq";
 	let mut body = format!("--{b}\r\nContent-Disposition: form-data; name=\"payload_json\"\r\nContent-Type: application/json\r\n\r\n{pay}\r\n").into_bytes();
-	if let Some(p) = png {
-		body.extend(format!("--{b}\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"quote.png\"\r\nContent-Type: image/png\r\n\r\n").as_bytes());
+	if let Some((p, n, t)) = file {
+		body.extend(format!("--{b}\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"{n}\"\r\nContent-Type: {t}\r\n\r\n").as_bytes());
 		body.extend(p);body.extend(b"\r\n");
 	}
 	body.extend(format!("--{b}--\r\n").as_bytes());
@@ -201,5 +229,13 @@ mod tests {
 		assert_eq!(tag("@&123"), "@role");
 		assert_eq!(tag("t:1700000000:R"), "2023-11-14");
 		assert_eq!(tag("https://x.y"), "https://x.y");
+	}
+
+	#[test]
+	fn gifs() {
+		assert_eq!(tenor("https://media.tenor.com/1s5oUIWc42UAAAP1/cats-cat.mp4").as_deref(), Some("https://media.tenor.com/1s5oUIWc42UAAAAM/cats-cat.gif"));
+		assert_eq!(tenor("https://media.tenor.com/1s5oUIWc42UAAAAe/cats-cat.png?x=1").as_deref(), Some("https://media.tenor.com/1s5oUIWc42UAAAAM/cats-cat.gif"));
+		assert_eq!(giphy("https://media2.giphy.com/media/abc123/giphy.mp4").as_deref(), Some("https://media.giphy.com/media/abc123/200.gif"));
+		assert_eq!(tenor("https://tenor.com/view/cat-gif-123"), None);
 	}
 }
