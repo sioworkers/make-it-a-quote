@@ -35,3 +35,4 @@ footer a:hover { color: var(--fg); }
 .doc a, .doc strong { color: var(--fg); }
 .meta { font-size: .9rem; }
 :focus-visible { outline: 2px solid var(--acc-l); outline-offset: 2px; }
+.preview { display: block; width: 100%; height: auto; margin-top: 2.5rem; border-radius: .75rem; border: 1px solid var(--line); }
