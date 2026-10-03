@@ -38,6 +38,7 @@ async fn fetch(req: Request, env: Env, wc: Context) -> Result<Response> {
 		(Method::Post, "/") => interaction(req, &mods::Cx { env, wc }).await,
 		(Method::Get, "/cmds") => Response::from_json(&mods::cmds()), // what this version registers
 		(Method::Get, "/") => web::home(&req, &env),
+		(Method::Get, "/preview.png") => web::preview(&env).await,
 		(Method::Get, "/done") => web::done(&req, &env).await,
 		(Method::Get, "/terms-of-service") => web::page(web::TERMS, &[]),
 		(Method::Get, "/privacy-policy") => web::page(web::PRIVACY, &[]),

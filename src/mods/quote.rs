@@ -1,48 +1,55 @@
 use super::{Cx, Mod, cmd, reply};
-use crate::card;
+use crate::card::{self, Card, Theme};
 use futures_util::future::join_all;
-use image::{GrayImage, ImageReader};
+use image::{DynamicImage, ImageReader, RgbImage};
 use serde_json::json;
 use twilight_model::{
 	application::{command::{Command, CommandType}, interaction::{Interaction, application_command::{CommandData, CommandOptionValue}}},
 	channel::Message,
+	id::marker::UserMarker,
 	http::interaction::{InteractionResponse, InteractionResponseType},
 	id::{Id, marker::{ChannelMarker, MessageMarker}},
 };
 use twilight_util::builder::command::StringBuilder;
-use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Result, Url, console_error, console_log, js_sys::Uint8Array};
+use worker::{CfProperties, Env, Fetch, Headers, Method, Request, RequestInit, Result, Url, console_error, console_log, js_sys::Uint8Array};
 
 const API: &str = "https://discord.com/api/v10";
 const SRC: &str = "https://github.com/sioworkers/make-it-a-quote";
 const FB: &[&str] = &["Noto Sans Math", "Noto Emoji", "Noto Sans Symbols 2", "Noto Sans Symbols", "Noto Sans JP", "Noto Sans KR", "Noto Sans SC", "Noto Sans Arabic", "Noto Sans Hebrew", "Noto Sans Devanagari", "Noto Sans Thai"]; // fallback order
 const MAX_PX: u64 = 4_200_000; // decode cap (~2048x2048), bigger = cpu limit
 const UA: &str = "Mozilla/5.0 (compatible; MIAQ; +https://miaq.sioworker.workers.dev)";
+const PREVIEW: (u64, &str) = (1182288174731505688, "I've built this so I don't have to pay $1/month."); // home page card
 
 pub struct Quote;
 
 impl Mod for Quote {
-	const NAMES: &[&str] = &["quote", "Quote"]; // slash, msg menu
+	const NAMES: &[&str] = &["quote", "Quote", "Quote (white)", "Quote (color)"]; // slash, msg menus
 
 	fn cmds() -> Vec<Command> {
 		vec![
-			cmd("quote", "Turn a message into a quote image", CommandType::ChatInput).option(StringBuilder::new("link", "Message link, from this channel").required(true)).build(),
+			cmd("quote", "Turn a message into a quote image", CommandType::ChatInput).option(StringBuilder::new("link", "Message link, from this channel").required(true)).option(StringBuilder::new("theme", "Look of the card").required(false).choices([("black", "black"), ("white", "white"), ("color", "color")])).build(),
 			cmd("Quote", "", CommandType::Message).build(),
+			cmd("Quote (white)", "", CommandType::Message).build(),
+			cmd("Quote (color)", "", CommandType::Message).build(),
 		]
 	}
 
 	async fn run(cx: &Cx, i: &Interaction, d: &CommandData) -> Result<InteractionResponse> {
+		let opt = |n: &str| d.options.iter().find(|o| o.name == n).and_then(|o| if let CommandOptionValue::String(s) = &o.value { Some(s.as_str()) } else { None });
+		let th = match (d.name.as_str(), opt("theme")) { ("Quote (white)", _) | (_, Some("white")) => Theme::White, ("Quote (color)", _) | (_, Some("color")) => Theme::Color, _ => Theme::Black };
 		let m = if d.kind == CommandType::Message {
 			d.target_id.and_then(|t| d.resolved.as_ref()?.messages.get(&t.cast()).cloned())
 		} else {
-			let link = d.options.iter().find(|o| o.name == "link").and_then(|o| if let CommandOptionValue::String(s) = &o.value { Some(s.as_str()) } else { None }).unwrap_or_default();
+			let link = opt("link").unwrap_or_default();
 			let Some((c, m)) = parse(link) else { return Ok(reply("That's not a message link. Right-click a message, Copy Message Link.")) };
 			if i.channel.as_ref().map(|x| x.id) != Some(c) { return Ok(reply("I can only quote messages from this channel. For others, right-click the message, then Apps, then Quote.")); } // else anyone could read chans they can't see
 			match get(&cx.env, c, m).await { Some(m) => Some(m), None => return Ok(reply("I can't see that message. Right-click it, then Apps, then Quote instead.")) }
 		};
 		let Some(m) = m else { return Ok(reply("Couldn't find that message.")) };
+		let mem = d.resolved.as_ref().and_then(|r| r.members.get(&m.author.id)).map(|x| (x.nick.clone(), x.avatar.map(|h| h.to_string())));
 		let i = i.clone();
 		cx.wc.wait_until(async move {
-			if let Err(e) = make(&i, &m).await {
+			if let Err(e) = make(&i, &m, mem, th).await {
 				console_error!("quote: {e}");
 				if let Err(e) = edit(&i, "Couldn't make that quote.", None).await { console_error!("quote edit: {e}"); }
 			}
@@ -65,26 +72,36 @@ async fn get(env: &Env, c: Id<ChannelMarker>, m: Id<MessageMarker>) -> Option<Me
 	r.json().await.ok()
 }
 
-async fn fetch(url: &str) -> Result<Vec<u8>> {
-	let h = Headers::new();h.set("User-Agent", UA)?;
+fn get_init(ua: &str) -> Result<RequestInit> { // GET w/ UA, cached at the edge for a day
+	let h = Headers::new();h.set("User-Agent", ua)?;
 	let mut init = RequestInit::new();init.with_headers(h);
+	init.cf = CfProperties { cache_everything: Some(true), cache_ttl: Some(86400), ..Default::default() };
+	Ok(init)
+}
+
+async fn fetch(url: &str) -> Result<Vec<u8>> {
+	let init = get_init(UA)?;
 	let mut r = Fetch::Request(Request::new_with_init(url, &init)?).send().await?;
 	if r.status_code() != 200 { return Err(format!("{url}: {}", r.status_code()).into()); }
 	r.bytes().await
 }
 
-async fn gray(url: &str) -> Option<GrayImage> {
+fn flat(i: DynamicImage, bg: u8) -> RgbImage { // alpha over the card bg so transparent pngs/emoji don't go black on white
+	let i = i.to_rgba8();
+	RgbImage::from_fn(i.width(), i.height(), |x, y| { let p = i.get_pixel(x, y).0;let a = p[3] as u32;image::Rgb([0, 1, 2].map(|c| ((p[c] as u32 * a + bg as u32 * (255 - a)) / 255) as u8)) })
+}
+
+async fn rgb(url: &str, bg: u8) -> Option<RgbImage> {
 	let b = fetch(url).await.map_err(|e| console_error!("img: {e}")).ok()?;
 	let r = ImageReader::new(std::io::Cursor::new(&b)).with_guessed_format().ok()?;
 	let (w, h) = r.into_dimensions().map_err(|e| console_error!("img dims: {e}")).ok()?;
 	if w as u64 * h as u64 > MAX_PX { console_error!("img too big: {w}x{h} {url}");return None; }
-	image::load_from_memory(&b).map(|i| i.to_luma8()).map_err(|e| console_error!("img decode: {e}")).ok()
+	image::load_from_memory(&b).map(|i| flat(i, bg)).map_err(|e| console_error!("img decode: {e}")).ok()
 }
 
 async fn gfont(fam: &str, text: &str) -> Option<Vec<u8>> { // google fonts subset w/ only these chars, old UA gets ttf
 	let u = Url::parse_with_params("https://fonts.googleapis.com/css2", [("family", fam), ("text", text)]).ok()?;
-	let h = Headers::new();h.set("User-Agent", "Wget/1.21").ok()?;
-	let mut init = RequestInit::new();init.with_headers(h);
+	let init = get_init("Wget/1.21").ok()?;
 	let css = Fetch::Request(Request::new_with_init(u.as_str(), &init).ok()?).send().await.ok()?.text().await.ok()?;
 	fetch(css.split("url(").nth(1)?.split(')').next()?).await.ok()
 }
@@ -152,8 +169,8 @@ fn date(t: i64) -> String { // unix -> 2026-09-27, civil from days
 	format!("{}-{m:02}-{d:02}", yoe + era * 400 + (m <= 2) as i64)
 }
 
-fn clean(m: &Message) -> String { // discord markup -> plain text
-	let mut s = m.content.clone();
+fn clean(m: &Message) -> (String, Vec<(u64, String)>) { // discord markup -> plain text, custom emoji -> char EMO+k w/ (id, name)
+	let (mut s, mut emo) = (m.content.clone(), vec![]);
 	for u in &m.mentions {
 		let n = format!("@{}", u.member.as_ref().and_then(|x| x.nick.as_deref()).unwrap_or(&u.name));
 		s = s.replace(&format!("<@{}>", u.id), &n).replace(&format!("<@!{}>", u.id), &n);
@@ -161,33 +178,79 @@ fn clean(m: &Message) -> String { // discord markup -> plain text
 	let (mut o, mut rest) = (String::new(), s.as_str());
 	while let Some(a) = rest.find('<') {
 		o += &rest[..a];
-		match rest[a..].find('>') { Some(b) => { o += &tag(&rest[a + 1..a + b]);rest = &rest[a + b + 1..]; } None => { o += &rest[a..];rest = ""; } }
+		match rest[a..].find('>') {
+			Some(b) => {
+				let t = &rest[a + 1..a + b];
+				let e = t.strip_prefix("a:").or_else(|| t.strip_prefix(':')).and_then(|e| { let (n, id) = e.split_once(':')?;Some((id.parse::<u64>().ok()?, n.to_string())) });
+				match e {
+					Some((id, n)) if emo.len() < 30 || emo.iter().any(|x: &(u64, String)| x.0 == id) => { let k = emo.iter().position(|x| x.0 == id).unwrap_or_else(|| { emo.push((id, n));emo.len() - 1 });o.push(char::from_u32(card::EMO + k as u32).unwrap_or(' ')); }
+					_ => o += &tag(t),
+				}
+				rest = &rest[a + b + 1..];
+			}
+			None => { o += &rest[a..];rest = ""; }
+		}
 	}
 	o += rest;
 	let o: Vec<String> = o.lines().map(|l| { let l = l.trim_start(); l.trim_start_matches("-# ").trim_start_matches(['#', '>']).trim_start().to_string() }).collect();
-	o.join("\n").replace("**", "").replace("__", "").replace("~~", "").replace("||", "").replace('`', "")
+	(o.join("\n").replace("**", "").replace("__", "").replace("~~", "").replace("||", "").replace('`', ""), emo)
 }
 
-fn avatar(m: &Message) -> String {
-	let u = &m.author;
-	match u.avatar { Some(h) => format!("https://cdn.discordapp.com/avatars/{}/{h}.png?size=512", u.id), None => format!("https://cdn.discordapp.com/embed/avatars/{}.png", (u.id.get() >> 22) % 6) }
+async fn emojis(text: &str, emo: &[(u64, String)], bg: u8) -> (String, Vec<RgbImage>) { // fetch custom emoji, ones that fail go back to :name:
+	let got = join_all(emo.iter().map(|(id, _)| rgb_any(format!("https://cdn.discordapp.com/emojis/{id}.png?size=64"), bg))).await;
+	let (mut imgs, mut map) = (vec![], vec![]);
+	for g in got { map.push(g.map(|i| { imgs.push(i);imgs.len() - 1 })); }
+	let t = text.chars().map(|c| {
+		let k = (c as u32).wrapping_sub(card::EMO) as usize;
+		match map.get(k) { Some(Some(n)) => char::from_u32(card::EMO + *n as u32).unwrap_or(' ').to_string(), Some(None) => format!(":{}:", emo[k].1), None => c.to_string() }
+	}).collect();
+	(t, imgs)
 }
 
-async fn make(i: &Interaction, m: &Message) -> Result<()> {
-	let mut text = clean(m);
+async fn rgb_any(u: String, bg: u8) -> Option<RgbImage> { rgb(&u, bg).await }
+
+fn avatar(u: Id<UserMarker>, h: Option<String>, guild: Option<(String, String)>) -> String { // server avatar if set, else user, else default
+	match (guild, h) {
+		(Some((g, gh)), _) => format!("https://cdn.discordapp.com/guilds/{g}/users/{u}/avatars/{gh}.png?size=512"),
+		(None, Some(h)) => format!("https://cdn.discordapp.com/avatars/{u}/{h}.png?size=512"),
+		_ => format!("https://cdn.discordapp.com/embed/avatars/{}.png", (u.get() >> 22) % 6),
+	}
+}
+
+pub async fn preview(env: &Env) -> Result<Vec<u8>> { // home page card, real avatar via bot api
+	let tok = env.secret("DISCORD_TOKEN")?.to_string();
+	let h = Headers::new();h.set("Authorization", &format!("Bot {tok}"))?;
+	let mut init = RequestInit::new();init.with_headers(h);
+	let u: serde_json::Value = Fetch::Request(Request::new_with_init(&format!("{API}/users/{}", PREVIEW.0), &init)?).send().await?.json().await?;
+	let av = rgb(&avatar(Id::new(PREVIEW.0), u["avatar"].as_str().map(String::from), None), 0).await;
+	let name = u["global_name"].as_str().or(u["username"].as_str()).unwrap_or("Sioworker").to_string();
+	let user = format!("@{}", u["username"].as_str().unwrap_or("sioworker"));
+	let fb = fonts(&format!("{}{name}{user}", PREVIEW.1)).await;
+	Ok(card::render(&Card { av: av.as_ref(), text: PREVIEW.1, name: &name, user: &user, reply: None, fb: &fb, emoji: &[], theme: Theme::Black }, None))
+}
+
+async fn make(i: &Interaction, m: &Message, mem: Option<(Option<String>, Option<String>)>, th: Theme) -> Result<()> {
+	let bg = if th == Theme::White { 255 } else { 0 };
+	let (mut text, emo) = clean(m);
 	let link_only = !m.embeds.is_empty() && m.attachments.is_empty() && !text.trim().contains(char::is_whitespace) && text.trim().starts_with("http");
 	if link_only { text.clear(); } // the link is the image, don't also print it
-	let av = gray(&avatar(m)).await;
-	let (name, user) = (m.author.global_name.clone().unwrap_or_else(|| m.author.name.clone()), format!("@{}", m.author.name));
-	let fb = fonts(&format!("{text}{name}{user}")).await;
+	let (nick, gav) = mem.or_else(|| m.member.as_ref().map(|x| (x.nick.clone(), x.avatar.map(|h| h.to_string())))).unwrap_or_default(); // server nick + avatar
+	let guild = i.guild_id.zip(gav).map(|(g, h)| (g.to_string(), h));
+	let av = rgb(&avatar(m.author.id, m.author.avatar.map(|h| h.to_string()), guild), bg).await;
+	let name = nick.or_else(|| m.author.global_name.clone()).unwrap_or_else(|| m.author.name.clone());
+	let user = format!("@{}", m.author.name);
+	let reply = m.referenced_message.as_ref().map(|r| format!("Replying to @{}", r.author.global_name.as_deref().unwrap_or(&r.author.name)));
+	let (text, emoji) = emojis(&text, &emo, bg).await;
+	let fb = fonts(&format!("{text}{name}{user}{}", reply.as_deref().unwrap_or_default())).await;
 	let mut fr = vec![];
 	if let Some(u) = gif_src(m) { console_log!("gif {u}");if let Ok(b) = fetch(&u).await.map_err(|e| console_error!("gif: {e}")) { fr = card::frames(&b); } }
+	let c = Card { av: av.as_ref(), text: &text, name: &name, user: &user, reply: reply.as_deref(), fb: &fb, emoji: &emoji, theme: th };
 	let file = if fr.len() > 1 {
-		(card::render_gif(av.as_ref(), &fr, &text, &name, &user, &fb), "quote.gif", "image/gif")
+		(card::render_gif(&c, &fr), "quote.gif", "image/gif")
 	} else {
 		let mut img = fr.pop().map(|f| f.0);
-		for u in pic(m, !text.trim().is_empty()) { if img.is_some() { break; } console_log!("pic {u}");img = gray(&u).await; }
-		(card::render(av.as_ref(), img.as_ref(), &text, &name, &user, &fb), "quote.png", "image/png")
+		for u in pic(m, !text.trim().is_empty()) { if img.is_some() { break; } console_log!("pic {u}");img = rgb(&u, bg).await; }
+		(card::render(&c, img.as_ref()), "quote.png", "image/png")
 	};
 	let g = i.guild_id.map_or("@me".into(), |g| g.to_string());
 	edit(i, &format!("-# [Jump to message](<https://discord.com/channels/{g}/{}/{}>) | [Source](<{SRC}>)", m.channel_id, m.id), Some(file)).await

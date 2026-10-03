@@ -62,4 +62,10 @@ fn asset(mut r: Response, ty: &str) -> Result<Response> {
 
 pub fn css() -> Result<Response> { asset(Response::ok(CSS)?, "text/css; charset=utf-8") }
 
+pub async fn preview(env: &Env) -> Result<Response> { // rendered live, browsers keep it a day
+	let mut r = Response::from_bytes(crate::mods::quote::preview(env).await?)?;
+	r.headers_mut().set("Content-Type", "image/png")?;r.headers_mut().set("Cache-Control", "public, max-age=86400")?;
+	Ok(r)
+}
+
 pub fn png(b: &str) -> Result<Response> { asset(Response::from_bytes(if b == "bubble" { BUBBLE } else { LOGO }.to_vec())?, "image/png") }
