@@ -276,8 +276,17 @@ pub async fn preview(env: &Env) -> Result<Vec<u8>> { // home page card, real ava
 	Ok(card::render(&Card { av: av.as_ref(), text: PREVIEW.1, name: &name, user: &user, reply: None, fb: &fb, emoji: &[], sty: &Default::default(), theme: Theme::Black }, None))
 }
 
+fn unforward(m: &Message) -> Option<Message> {
+	let s = &m.message_snapshots.first()?.message;
+	let mut m = m.clone();
+	(m.content, m.attachments, m.embeds, m.mentions) = (s.content.clone(), s.attachments.clone(), s.embeds.clone(), s.mentions.clone());
+	Some(m)
+}
+
 async fn make(i: &Interaction, m: &Message, mem: Option<(Option<String>, Option<String>)>, th: Theme) -> Result<()> {
 	let bg = if th == Theme::White { 255 } else { 0 };
+	let fwd = unforward(m);
+	let m = fwd.as_ref().unwrap_or(m);
 	let (mut text, emo) = clean(m);
 	let link_only = !m.embeds.is_empty() && m.attachments.is_empty() && !text.trim().contains(char::is_whitespace) && text.trim().starts_with("http");
 	if link_only { text.clear(); } // the link is the image, don't also print it
@@ -286,7 +295,7 @@ async fn make(i: &Interaction, m: &Message, mem: Option<(Option<String>, Option<
 	let av = rgb(&avatar(m.author.id, m.author.avatar.map(|h| h.to_string()), guild), bg).await;
 	let name = nick.or_else(|| m.author.global_name.clone()).unwrap_or_else(|| m.author.name.clone());
 	let user = format!("@{}", m.author.name);
-	let reply = m.referenced_message.as_ref().map(|r| format!("Replying to @{}", r.author.global_name.as_deref().unwrap_or(&r.author.name)));
+	let reply = if fwd.is_some() { Some("Forwarded".into()) } else { m.referenced_message.as_ref().map(|r| format!("Replying to @{}", r.author.global_name.as_deref().unwrap_or(&r.author.name))) };
 	let (text, emoji) = emojis(&text, &emo, bg).await;
 	let (fb, sty) = join(fonts(&format!("{text}{name}{user}{}", reply.as_deref().unwrap_or_default())), styled(&text)).await;
 	let mut fr = vec![];
@@ -350,6 +359,15 @@ mod tests {
 		assert_eq!(s("2 * 3 * 4 and *open"), "2 * 3 * 4 and *open");
 		assert_eq!(s("\\*no\\*"), "*no*");
 		assert_eq!(s("```rs\nlet x;```"), "<16>let x;<0>");
+	}
+
+	#[test]
+	fn forwards() {
+		let msg = |extra: &str| serde_json::from_str::<Message>(&format!(r#"{{"id":"3","channel_id":"2","author":{{"id":"1","username":"fwd","discriminator":"0","avatar":null}},"content":"","timestamp":"2026-10-17T10:00:00+00:00","edited_timestamp":null,"tts":false,"mention_everyone":false,"mentions":[],"mention_roles":[],"attachments":[],"embeds":[],"pinned":false,"type":0,"flags":16384{extra}}}"#)).unwrap();
+		let f = msg(r#","message_reference":{"type":1,"channel_id":"9","message_id":"8"},"message_snapshots":[{"message":{"content":"**hi** there","attachments":[],"embeds":[],"type":0,"timestamp":"2026-10-16T10:00:00+00:00","edited_timestamp":null}}]"#);
+		let u = unforward(&f).unwrap();
+		assert_eq!((u.content.as_str(), u.author.name.as_str()), ("**hi** there", "fwd"));
+		assert!(unforward(&msg("")).is_none());
 	}
 
 	#[test]
