@@ -1,6 +1,6 @@
 use super::{Cx, Mod, cmd, reply};
 use crate::card::{self, Card, Theme};
-use futures_util::future::join_all;
+use futures_util::future::{join, join_all};
 use image::{DynamicImage, ImageReader, RgbImage};
 use serde_json::json;
 use twilight_model::{
@@ -119,6 +119,17 @@ async fn fonts(s: &str) -> Vec<Vec<u8>> { // fallbacks for what noto serif can't
 	out
 }
 
+async fn styled(s: &str) -> [Option<Vec<u8>>; 3] { // bold, bold italic, mono subsets for the chars that use them, None = card fakes it
+	let (mut need, mut st) = ([String::new(), String::new(), String::new()], 0);
+	for c in s.chars() {
+		if let Some(b) = card::sty(c) { st = b;continue; }
+		let k = if st & card::CODE != 0 { 2 } else if st & card::BD == 0 { continue } else if st & card::IT != 0 { 1 } else { 0 };
+		if !c.is_whitespace() && !need[k].contains(c) { need[k].push(c); }
+	}
+	let fam = ["Noto Serif:wght@700", "Noto Serif:ital,wght@1,700", "Noto Sans Mono"];
+	join_all(need.iter().zip(fam).map(|(n, f)| async move { if n.is_empty() { None } else { gfont(f, n).await } })).await.try_into().unwrap_or_default()
+}
+
 fn pic(m: &Message, text: bool) -> Vec<String> { // first image as urls to try: media proxy at the exact size we draw, then the original (proxy 403s workers sometimes)
 	let a = m.attachments.iter().find(|a| a.content_type.as_deref().is_some_and(|t| t.starts_with("image/")) || (a.content_type.is_none() && a.width.is_some())).map(|a| (Some(a.proxy_url.clone()), a.url.clone(), a.width, a.height));
 	let e = || m.embeds.iter().find_map(|e| e.image.as_ref().map(|i| (i.proxy_url.clone(), i.url.clone(), i.width, i.height)).or_else(|| e.thumbnail.as_ref().map(|t| (t.proxy_url.clone(), t.url.clone(), t.width, t.height))));
@@ -169,8 +180,41 @@ fn date(t: i64) -> String { // unix -> 2026-09-27, civil from days
 	format!("{}-{m:02}-{d:02}", yoe + era * 400 + (m <= 2) as i64)
 }
 
-fn clean(m: &Message) -> (String, Vec<(u64, String)>) { // discord markup -> plain text, custom emoji -> char EMO+k w/ (id, name)
+fn md(s: &str) -> String { // discord markdown -> formatted text
+	const UI: u32 = 64; // separate _ from *, so  for example _x* (* doesn't close _)
+	let c: Vec<char> = s.chars().collect();
+	let at = |i: usize, t: &str| t.chars().enumerate().all(|(k, ch)| c.get(i + k) == Some(&ch));
+	let later = |i: usize, t: &str| (i..c.len()).any(|j| at(j, t));
+	let alnum = |i: Option<usize>| i.and_then(|i| c.get(i)).is_some_and(|c| c.is_alphanumeric());
+	let ws = |i: Option<usize>| i.and_then(|i| c.get(i)).is_none_or(|c| c.is_whitespace());
+	let (mut o, mut st, mut i, mut code) = (String::new(), 0, 0, None::<&str>);
+	let put = |o: &mut String, st: u32| o.push(card::mark(st | if st & UI != 0 { card::IT } else { 0 }));
+	while i < c.len() {
+		if let Some(t) = code { // literal till the closer
+			if at(i, t) { code = None;st &= !card::CODE;put(&mut o, st);i += t.len(); } else { o.push(c[i]);i += 1; }
+			continue;
+		}
+		if c[i] == '\\' && c.get(i + 1).is_some_and(|n| n.is_ascii_punctuation()) { o.push(c[i + 1]);i += 2;continue; }
+		if let Some(t) = ["```", "``", "`"].into_iter().find(|t| at(i, t) && later(i + t.len(), t)) {
+			code = Some(t);st |= card::CODE;put(&mut o, st);i += t.len();
+			if t == "```" { let mut j = i;while c.get(j).is_some_and(|ch| ch.is_alphanumeric() || "+-#_.".contains(*ch)) { j += 1; } if c.get(j) == Some(&'\n') { i = j + 1; } } // ```lang
+			continue;
+		}
+		let tog = [("**", card::BD), ("__", card::UL), ("~~", card::ST), ("||", card::SPOIL), ("*", card::IT), ("_", UI)];
+		let ok = |t: &str, b: u32| {
+			let (prev, next) = (i.checked_sub(1), Some(i + t.len()));
+			let u = t == "_";
+			if st & b != 0 { !(ws(prev) || u && alnum(next)) } else { !(ws(next) || u && alnum(prev)) && later(i + t.len(), t) }
+		};
+		if let Some(&(t, b)) = tog.iter().find(|(t, b)| at(i, t) && ok(t, *b)) { st ^= b;put(&mut o, st);i += t.len();continue; }
+		o.push(c[i]);i += 1;
+	}
+	o
+}
+
+fn clean(m: &Message) -> (String, Vec<(u64, String)>) { // discord markup -> styled text, custom emoji -> char EMO+k w/ (id, name)
 	let (mut s, mut emo) = (m.content.clone(), vec![]);
+	s.retain(|c| card::sty(c).is_none()); // markers are ours
 	for u in &m.mentions {
 		let n = format!("@{}", u.member.as_ref().and_then(|x| x.nick.as_deref()).unwrap_or(&u.name));
 		s = s.replace(&format!("<@{}>", u.id), &n).replace(&format!("<@!{}>", u.id), &n);
@@ -192,8 +236,11 @@ fn clean(m: &Message) -> (String, Vec<(u64, String)>) { // discord markup -> pla
 		}
 	}
 	o += rest;
-	let o: Vec<String> = o.lines().map(|l| { let l = l.trim_start(); l.trim_start_matches("-# ").trim_start_matches(['#', '>']).trim_start().to_string() }).collect();
-	(o.join("\n").replace("**", "").replace("__", "").replace("~~", "").replace("||", "").replace('`', ""), emo)
+	let o: Vec<String> = o.lines().map(|l| {
+		let l = l.trim_start().trim_start_matches("-# ").trim_start_matches(['#', '>']).trim_start();
+		l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")).map_or(l.into(), |r| format!("• {r}"))
+	}).collect();
+	(md(&o.join("\n")), emo)
 }
 
 async fn emojis(text: &str, emo: &[(u64, String)], bg: u8) -> (String, Vec<RgbImage>) { // fetch custom emoji, ones that fail go back to :name:
@@ -226,7 +273,7 @@ pub async fn preview(env: &Env) -> Result<Vec<u8>> { // home page card, real ava
 	let name = u["global_name"].as_str().or(u["username"].as_str()).unwrap_or("Sioworker").to_string();
 	let user = format!("@{}", u["username"].as_str().unwrap_or("sioworker"));
 	let fb = fonts(&format!("{}{name}{user}", PREVIEW.1)).await;
-	Ok(card::render(&Card { av: av.as_ref(), text: PREVIEW.1, name: &name, user: &user, reply: None, fb: &fb, emoji: &[], theme: Theme::Black }, None))
+	Ok(card::render(&Card { av: av.as_ref(), text: PREVIEW.1, name: &name, user: &user, reply: None, fb: &fb, emoji: &[], sty: &Default::default(), theme: Theme::Black }, None))
 }
 
 async fn make(i: &Interaction, m: &Message, mem: Option<(Option<String>, Option<String>)>, th: Theme) -> Result<()> {
@@ -241,10 +288,10 @@ async fn make(i: &Interaction, m: &Message, mem: Option<(Option<String>, Option<
 	let user = format!("@{}", m.author.name);
 	let reply = m.referenced_message.as_ref().map(|r| format!("Replying to @{}", r.author.global_name.as_deref().unwrap_or(&r.author.name)));
 	let (text, emoji) = emojis(&text, &emo, bg).await;
-	let fb = fonts(&format!("{text}{name}{user}{}", reply.as_deref().unwrap_or_default())).await;
+	let (fb, sty) = join(fonts(&format!("{text}{name}{user}{}", reply.as_deref().unwrap_or_default())), styled(&text)).await;
 	let mut fr = vec![];
 	if let Some(u) = gif_src(m) { console_log!("gif {u}");if let Ok(b) = fetch(&u).await.map_err(|e| console_error!("gif: {e}")) { fr = card::frames(&b); } }
-	let c = Card { av: av.as_ref(), text: &text, name: &name, user: &user, reply: reply.as_deref(), fb: &fb, emoji: &emoji, theme: th };
+	let c = Card { av: av.as_ref(), text: &text, name: &name, user: &user, reply: reply.as_deref(), fb: &fb, emoji: &emoji, sty: &sty, theme: th };
 	let file = if fr.len() > 1 {
 		(card::render_gif(&c, &fr), "quote.gif", "image/gif")
 	} else {
@@ -292,6 +339,17 @@ mod tests {
 		assert_eq!(tag("@&123"), "@role");
 		assert_eq!(tag("t:1700000000:R"), "2023-11-14");
 		assert_eq!(tag("https://x.y"), "https://x.y");
+	}
+
+	#[test]
+	fn markdown() {
+		let s = |t: &str| md(t).chars().map(|c| card::sty(c).map_or(c.to_string(), |b| format!("<{b}>"))).collect::<String>();
+		assert_eq!(s("**b** *i* ***bi***"), "<2>b<0> <1>i<0> <2><3>bi<1><0>");
+		assert_eq!(s("__u__ ~~s~~ ||x|| `**c**`"), "<4>u<0> <8>s<0> <32>x<0> <16>**c**<0>");
+		assert_eq!(s("_i_ snake_case_name"), "<1>i<0> snake_case_name");
+		assert_eq!(s("2 * 3 * 4 and *open"), "2 * 3 * 4 and *open");
+		assert_eq!(s("\\*no\\*"), "*no*");
+		assert_eq!(s("```rs\nlet x;```"), "<16>let x;<0>");
 	}
 
 	#[test]

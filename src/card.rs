@@ -14,6 +14,13 @@ const MAXF: usize = 150; // gif frames decoded at most
 const OUTF: usize = 40; // gif frames written at most, rest dropped evenly
 const GIF_PX: u64 = 8_000_000; // decode budget, frames * w * h
 pub const EMO: u32 = 0xF0000; // custom emoji k = char EMO+k (private use)
+pub const STY: u32 = 0xE000; // style marker = char STY+bits, style from here on (private use)
+pub const IT: u32 = 1;
+pub const BD: u32 = 2;
+pub const UL: u32 = 4;
+pub const ST: u32 = 8;
+pub const CODE: u32 = 16;
+pub const SPOIL: u32 = 32;
 
 static REG: &[u8] = include_bytes!("../assets/serif.ttf");
 static ITA: &[u8] = include_bytes!("../assets/serif-i.ttf");
@@ -34,33 +41,58 @@ pub struct Card<'a> {
 	pub reply: Option<&'a str>, // "Replying to @x"
 	pub fb: &'a [Vec<u8>], // extra fonts for chars noto serif lacks
 	pub emoji: &'a [RgbImage],
+	pub sty: &'a [Option<Vec<u8>>; 3], // bold, bold italic, mono. None = fake bold / plain
 	pub theme: Theme,
 }
+
+pub fn sty(c: char) -> Option<u32> { (c as u32).checked_sub(STY).filter(|&b| b < 64) }
+
+pub fn mark(b: u32) -> char { char::from_u32(STY + (b & 63)).unwrap_or(' ') }
+
+fn bold_px(px: f32) -> f32 { (px / 28.).round().max(1.) } // fake bold stroke
 
 type Bm = (i32, i32, u32, Vec<u8>); // off x, off y, w, coverage
 
 #[derive(Clone, Copy)]
 enum Gl { F(usize, GlyphId), E(usize) } // font glyph or custom emoji
 
-struct Fs<'a>(Vec<FontRef<'a>>, &'a [RgbImage]); // 0 reg, 1 ita, 2.. fallbacks; custom emoji
+struct Fs<'a> { f: Vec<FontRef<'a>>, emo: &'a [RgbImage], sty: [Option<usize>; 3], fb: usize } // f: 0 reg, 1 ita, styled, fallbacks from fb
 
-impl Fs<'_> {
-	fn pick(&self, fi: usize, c: char) -> Option<Gl> { // emoji, wanted font, then fallbacks, then reg
-		let e = (c as u32).wrapping_sub(EMO) as usize;
-		if e < self.1.len() { return Some(Gl::E(e)); }
-		[fi].into_iter().chain(2..self.0.len()).chain([0]).map(|i| (i, self.0[i].glyph_id(c))).find(|(_, g)| g.0 != 0).map(|(i, g)| Gl::F(i, g))
+struct Gp { gl: Gl, x: f32, a: f32, st: u32, fake: bool } // placed glyph: x, advance, style
+
+impl<'a> Fs<'a> {
+	fn new(c: &'a Card) -> Self {
+		let mut f: Vec<FontRef> = [REG, ITA].into_iter().filter_map(|b| FontRef::try_from_slice(b).ok()).collect(); // bundled 2 can't fail
+		let sty = c.sty.each_ref().map(|b| { f.push(FontRef::try_from_slice(b.as_deref()?).ok()?);Some(f.len() - 1) });
+		let fb = f.len();
+		f.extend(c.fb.iter().filter_map(|b| FontRef::try_from_slice(b).ok()));
+		Fs { f, emo: c.emoji, sty, fb }
 	}
 
-	fn walk(&self, fi: usize, px: f32, s: &str, mut f: impl FnMut(Gl, f32)) -> f32 { // x of each glyph, returns width. kern only within one font
-		let (mut x, mut prev) = (0., None::<(usize, GlyphId)>);
+	fn font(&self, fi: usize, st: u32) -> usize { // font for a style, base fi when there's no real one
+		if st & CODE != 0 { return self.sty[2].unwrap_or(fi); }
+		match (st & BD != 0, fi == 1 || st & IT != 0) { (true, false) => self.sty[0].unwrap_or(0), (true, true) => self.sty[1].unwrap_or(1), (false, true) => 1, _ => fi }
+	}
+
+	fn pick(&self, fi: usize, c: char) -> Option<Gl> { // emoji, wanted font, then fallbacks, then reg
+		let e = (c as u32).wrapping_sub(EMO) as usize;
+		if e < self.emo.len() { return Some(Gl::E(e)); }
+		[fi].into_iter().chain(self.fb..self.f.len()).chain([0]).map(|i| (i, self.f[i].glyph_id(c))).find(|(_, g)| g.0 != 0).map(|(i, g)| Gl::F(i, g))
+	}
+
+	fn walk(&self, fi: usize, px: f32, s: &str, mut f: impl FnMut(Gp)) -> f32 { // place each glyph, returns width. kern only within one font
+		let (mut x, mut prev, mut st) = (0., None::<(usize, GlyphId)>, 0);
 		for c in s.chars() {
-			let Some(gl) = self.pick(fi, c) else { continue };
+			if let Some(b) = sty(c) { st = b;prev = None;continue; }
+			let Some(gl) = self.pick(self.font(fi, st), c) else { continue };
 			match gl {
-				Gl::E(_) => { f(gl, x);x += px * 1.15;prev = None; }
+				Gl::E(_) => { let a = px * 1.15;f(Gp { gl, x, a, st, fake: false });x += a;prev = None; }
 				Gl::F(i, g) => {
-					let sf = self.0[i].as_scaled(PxScale::from(px));
+					let sf = self.f[i].as_scaled(PxScale::from(px));
 					if let Some((pi, pg)) = prev && pi == i { x += sf.kern(pg, g); }
-					f(gl, x);x += sf.h_advance(g);prev = Some((i, g));
+					let fake = st & BD != 0 && !self.sty[..2].contains(&Some(i));
+					let a = sf.h_advance(g) + if fake { bold_px(px) } else { 0. };
+					f(Gp { gl, x, a, st, fake });x += a;prev = Some((i, g));
 				}
 			}
 		}
@@ -68,7 +100,15 @@ impl Fs<'_> {
 	}
 }
 
-fn ignorable(c: char) -> bool { c.is_whitespace() || c.is_control() || (c as u32) >= EMO || matches!(c, '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0000}'..='\u{E007F}') }
+fn spans(gs: &[Gp], b: u32) -> Vec<(f32, f32)> { // x ranges of runs with style bit b, merged so overlaps don't double up
+	let mut out: Vec<(f32, f32)> = vec![];
+	for g in gs.iter().filter(|g| g.st & b != 0) {
+		match out.last_mut() { Some(l) if g.x <= l.1 + 1. => l.1 = l.1.max(g.x + g.a), _ => out.push((g.x, g.x + g.a)) }
+	}
+	out
+}
+
+fn ignorable(c: char) -> bool { c.is_whitespace() || c.is_control() || (c as u32) >= EMO || sty(c).is_some() || matches!(c, '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0000}'..='\u{E007F}') }
 
 pub fn lacks(font: &[u8], s: &str) -> String { // chars in s this font can't draw, deduped
 	let Ok(f) = FontRef::try_from_slice(font) else { return String::new() };
@@ -101,55 +141,74 @@ impl Cv {
 		}
 	}
 
+	fn rect(&mut self, (x0, x1): (f32, f32), y0: f32, y1: f32, v: u8, a: f32) {
+		for y in y0.round() as i32..y1.round() as i32 { for x in x0.round() as i32..x1.round() as i32 { self.put(x, y, [v; 3], a); } }
+	}
+
 	fn line(&mut self, fs: &Fs, fi: usize, px: f32, s: &str, base: f32, v: u8) { // centered in text area, glyphs snapped to whole px so they can be cached
 		let x0 = TX + (TW - width(fs, fi, px, s)) / 2.;
-		let mut gs = vec![];fs.walk(fi, px, s, |g, x| gs.push((g, x)));
-		for (gl, x) in gs {
-			let (gx, gy) = ((x0 + x).round() as i32, base.round() as i32);
-			let (i, g) = match gl {
-				Gl::E(e) => { let sz = px as u32;let im = scale(&fs.1[e], sz, sz);self.img(&im, (gx.max(0) as u32 + 1).min(W - 1), (gy - (px * 0.86) as i32).max(0) as u32);continue; }
+		let mut gs = vec![];fs.walk(fi, px, s, |g| gs.push(Gp { x: x0 + g.x, ..g }));
+		let (top, bot, th) = (base - px * 0.8, base + px * 0.24, (px / 16.).round().max(1.));
+		for s in spans(&gs, CODE) { self.rect((s.0 - 4., s.1 + 4.), top, bot, v, 0.12); }
+		for s in spans(&gs, SPOIL) { self.rect(s, top, bot, v, 0.3); } // hidden, like discord
+		for g in gs.iter().filter(|g| g.st & SPOIL == 0) {
+			let (gx, gy) = (g.x.round() as i32, base.round() as i32);
+			let (i, gid) = match g.gl {
+				Gl::E(e) => { let sz = px as u32;let im = scale(&fs.emo[e], sz, sz);self.img(&im, (gx.max(0) as u32 + 1).min(W - 1), (gy - (px * 0.86) as i32).max(0) as u32);continue; }
 				Gl::F(i, g) => (i, g),
 			};
-			let k = (i as u8, g.0, px.to_bits());
+			let k = (i as u8, gid.0, px.to_bits());
 			let bm = self.gc.entry(k).or_insert_with(|| {
-				let o = fs.0[i].outline_glyph(g.with_scale_and_position(px, point(0., 0.)))?;
+				let o = fs.f[i].outline_glyph(gid.with_scale_and_position(px, point(0., 0.)))?;
 				let b = o.px_bounds();let w = b.width() as u32;
 				let mut cov = vec![0u8; (w * b.height() as u32) as usize];
 				o.draw(|x, y, a| cov[(y * w + x) as usize] = (a.min(1.) * 255.) as u8);
 				Some((b.min.x as i32, b.min.y as i32, w, cov))
 			}).take();
 			let Some((ox, oy, w, cov)) = bm else { continue };
-			let mut j = 0;while j < cov.len() {
-				if cov[j] > 0 { self.put(gx + ox + (j as u32 % w) as i32, gy + oy + (j as u32 / w) as i32, [v; 3], cov[j] as f32 / 255.); }
-				j += 1;
+			for dx in 0..=if g.fake { bold_px(px) as i32 } else { 0 } {
+				let mut j = 0;while j < cov.len() {
+					if cov[j] > 0 { self.put(gx + dx + ox + (j as u32 % w) as i32, gy + oy + (j as u32 / w) as i32, [v; 3], cov[j] as f32 / 255.); }
+					j += 1;
+				}
 			}
 			self.gc.insert(k, Some((ox, oy, w, cov)));
 		}
+		let vis: Vec<Gp> = gs.into_iter().filter(|g| g.st & SPOIL == 0).collect();
+		for s in spans(&vis, UL) { self.rect(s, base + px * 0.1, base + px * 0.1 + th, v, 1.); }
+		for s in spans(&vis, ST) { self.rect(s, base - px * 0.3, base - px * 0.3 + th, v, 1.); }
 	}
 }
 
-fn width(fs: &Fs, fi: usize, px: f32, s: &str) -> f32 { fs.walk(fi, px, s, |_, _| {}) }
+fn width(fs: &Fs, fi: usize, px: f32, s: &str) -> f32 { fs.walk(fi, px, s, |_| {}) }
 
-fn wrap(fs: &Fs, fi: usize, px: f32, s: &str, max: f32) -> Vec<String> { // greedy, breaks long words by char, word widths summed (no kern across spaces)
+fn restyle(st: u32, s: &str) -> u32 { s.chars().rev().find_map(sty).unwrap_or(st) } // style after s
+
+fn wrap(fs: &Fs, fi: usize, px: f32, s: &str, max: f32) -> Vec<String> { // greedy, breaks long words by char, word widths summed (no kern across spaces). lines start w/ the style they're in
 	let sp = width(fs, fi, px, " ");
-	let mut out = vec![];
+	let (mut out, mut st) = (vec![], 0);
 	for para in s.split('\n') {
 		let (mut cur, mut cw) = (String::new(), 0.);
 		for w in para.split_whitespace() {
-			let ww = width(fs, fi, px, w);
+			let ww = width(fs, fi, px, &format!("{}{w}", mark(st)));
+			let st0 = st;st = restyle(st, w);
 			if cur.is_empty() && ww <= max { cur = w.into();cw = ww;continue; }
 			if !cur.is_empty() && cw + sp + ww <= max { cur.push(' ');cur += w;cw += sp + ww;continue; }
 			if !cur.is_empty() { out.push(std::mem::take(&mut cur));cw = 0.; }
 			if ww <= max { cur = w.into();cw = ww;continue; }
+			let mut cs = st0;
 			for c in w.chars() { // too long for a line
-				let c_w = width(fs, fi, px, c.encode_utf8(&mut [0; 4]));
+				cs = restyle(cs, c.encode_utf8(&mut [0; 4]));
+				let c_w = width(fs, fi, px, &format!("{}{c}", mark(cs)));
 				if cw + c_w > max && !cur.is_empty() { out.push(std::mem::take(&mut cur));cw = 0.; }
 				cur.push(c);cw += c_w;
 			}
 		}
 		out.push(cur);
 	}
-	while out.last().is_some_and(|l| l.is_empty()) { out.pop(); }
+	while out.last().is_some_and(|l| l.chars().all(|c| sty(c).is_some())) { out.pop(); }
+	let mut st = 0;
+	for l in &mut out { let s0 = st;st = restyle(st, l);if s0 != 0 { l.insert(0, mark(s0)); } }
 	out
 }
 
@@ -209,7 +268,7 @@ fn avatar(cv: &mut Cv, a: &RgbImage) { // to HxH at x=0, smoothstep fade into bg
 type Rect = (u32, u32, u32, u32); // x, y, w, h
 
 fn compose(c: &Card, img: Option<&RgbImage>) -> (Vec<u8>, Option<Rect>) {
-	let fs = Fs([REG, ITA].into_iter().chain(c.fb.iter().map(|b| &b[..])).filter_map(|b| FontRef::try_from_slice(b).ok()).collect(), c.emoji); // bundled 2 can't fail
+	let fs = Fs::new(c);
 	let (bg, tc, nc, uc) = c.theme.pal();
 	let mut cv = Cv { p: vec![bg; (W * H * 3) as usize], gc: Default::default(), th: c.theme };
 	if let Some(a) = c.av { avatar(&mut cv, a); }
@@ -339,11 +398,13 @@ mod tests {
 		let name = if fb.is_empty() { "Some Person" } else { "𝐁𝐮𝐭𝐭𝐞𝐫𝐃𝐞𝐯 𝟐.𝟏 😀" };
 		assert!(!missing(name).contains('B') && missing("𝐁 x").chars().count() == 1 && missing(&format!("{e}x")).is_empty());
 		let short = format!("never gonna give you up {e}");
+		let m = |b| mark(b);
+		let md = format!("{}bold{} {}italic{} {}both{} {}code(){} {}under{} {}gone{} {}spoiler{} and a {}long bold run that wraps onto the next line{}", m(BD), m(0), m(IT), m(0), m(BD | IT), m(0), m(CODE), m(0), m(UL), m(0), m(ST), m(0), m(SPOIL), m(0), m(BD), m(0));
 		type Case<'a> = (&'a str, Option<&'a RgbImage>, &'a str, Theme, Option<&'a str>);
-		let cases: [Case; 6] = [("short", None, &short, Theme::Black, None), ("long", None, &long, Theme::Black, None), ("img", Some(&pic), "look at this", Theme::Black, Some("Replying to @someone")), ("only_img", Some(&pic), "", Theme::Black, None), ("white", Some(&pic), &short, Theme::White, Some("Replying to @someone")), ("color", Some(&pic), &short, Theme::Color, None)];
+		let cases: [Case; 7] = [("md", None, &md, Theme::Black, None), ("short", None, &short, Theme::Black, None), ("long", None, &long, Theme::Black, None), ("img", Some(&pic), "look at this", Theme::Black, Some("Replying to @someone")), ("only_img", Some(&pic), "", Theme::Black, None), ("white", Some(&pic), &short, Theme::White, Some("Replying to @someone")), ("color", Some(&pic), &short, Theme::Color, None)];
 		for (n, im, t, th, reply) in cases {
 			let t0 = std::time::Instant::now();
-			let c = Card { av: Some(&av), text: t, name, user: "@someone", reply, fb: &fb, emoji: &emo, theme: th };
+			let c = Card { av: Some(&av), text: t, name, user: "@someone", reply, fb: &fb, emoji: &emo, sty: &Default::default(), theme: th };
 			let png = render(&c, im);
 			eprintln!("{n}: {:?} {}KB", t0.elapsed(), png.len() / 1024);
 			assert_eq!(&png[1..4], b"PNG");
@@ -355,7 +416,7 @@ mod tests {
 				let t0 = std::time::Instant::now();
 				let fr = frames(&b);let t1 = t0.elapsed();
 				let th = if k == 0 { Theme::Black } else { Theme::Color };
-				let c = Card { av: Some(&av), text: if k == 0 { "" } else { "when the cat" }, name, user: "@someone", reply: None, fb: &fb, emoji: &emo, theme: th };
+				let c = Card { av: Some(&av), text: if k == 0 { "" } else { "when the cat" }, name, user: "@someone", reply: None, fb: &fb, emoji: &emo, sty: &Default::default(), theme: th };
 				let out = render_gif(&c, &fr);
 				eprintln!("gif{k}: {} frames, decode {t1:?}, total {:?}, {}KB", fr.len(), t0.elapsed(), out.len() / 1024);
 				assert_eq!(&out[..3], b"GIF");
