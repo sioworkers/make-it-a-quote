@@ -301,7 +301,7 @@ async fn make(env: &Env, i: &Interaction, m: &Message, mem: Option<(Option<Strin
 	let referenced = if context {
 		match m.referenced_message.clone() {
 			Some(r) => Some(r),
-			None => match m.message_reference.as_ref().and_then(|r| r.channel_id.zip(r.message_id)) { Some((c, id)) => get(env, c, id).await, None => None },
+			None => match m.reference.as_ref().and_then(|r| r.channel_id.zip(r.message_id)) { Some((c, id)) => get(env, c, id).await.map(Box::new), None => None },
 		}
 	} else { None };
 	let reply = if fwd.is_some() { Some("Forwarded".into()) } else { referenced.as_ref().map(|r| format!("Replying to @{}", r.author.global_name.as_deref().unwrap_or(&r.author.name))) };
