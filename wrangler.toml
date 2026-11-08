@@ -7,3 +7,17 @@ command = "cargo install -q \"worker-build@^0.8\" && worker-build --release"
 
 [vars]
 CLIENT_ID = "1217542706033852498"
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
+
+[observability.traces]
+enabled = false
+head_sampling_rate = 1
+persist = true
+
+[observability.issue_detection]
+enabled = false
