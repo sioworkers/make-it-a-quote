@@ -23,7 +23,7 @@ const PREVIEW: (u64, &str) = (1182288174731505688, "I've built this so I don't h
 pub struct Quote;
 
 impl Mod for Quote {
-	const NAMES: &[&str] = &["quote", "Quote", "Quote (white)", "Quote (color)"]; // slash, msg menus
+	const NAMES: &[&str] = &["quote", "Quote", "Quote (white)", "Quote (color)", "Quote (Without Context)"]; // slash, msg menus
 
 	fn cmds() -> Vec<Command> {
 		vec![
@@ -31,12 +31,14 @@ impl Mod for Quote {
 			cmd("Quote", "", CommandType::Message).build(),
 			cmd("Quote (white)", "", CommandType::Message).build(),
 			cmd("Quote (color)", "", CommandType::Message).build(),
+			cmd("Quote (Without Context)", "", CommandType::Message).build(),
 		]
 	}
 
 	async fn run(cx: &Cx, i: &Interaction, d: &CommandData) -> Result<InteractionResponse> {
 		let opt = |n: &str| d.options.iter().find(|o| o.name == n).and_then(|o| if let CommandOptionValue::String(s) = &o.value { Some(s.as_str()) } else { None });
 		let th = match (d.name.as_str(), opt("theme")) { ("Quote (white)", _) | (_, Some("white")) => Theme::White, ("Quote (color)", _) | (_, Some("color")) => Theme::Color, _ => Theme::Black };
+		let context = d.name != "Quote (Without Context)";
 		let m = if d.kind == CommandType::Message {
 			d.target_id.and_then(|t| d.resolved.as_ref()?.messages.get(&t.cast()).cloned())
 		} else {
@@ -48,8 +50,9 @@ impl Mod for Quote {
 		let Some(m) = m else { return Ok(reply("Couldn't find that message.")) };
 		let mem = d.resolved.as_ref().and_then(|r| r.members.get(&m.author.id)).map(|x| (x.nick.clone(), x.avatar.map(|h| h.to_string())));
 		let i = i.clone();
+		let env = cx.env.clone();
 		cx.wc.wait_until(async move {
-			if let Err(e) = make(&i, &m, mem, th).await {
+			if let Err(e) = make(&env, &i, &m, mem, th, context).await {
 				console_error!("quote: {e}");
 				if let Err(e) = edit(&i, "Couldn't make that quote.", None).await { console_error!("quote edit: {e}"); }
 			}
@@ -283,7 +286,7 @@ fn unforward(m: &Message) -> Option<Message> {
 	Some(m)
 }
 
-async fn make(i: &Interaction, m: &Message, mem: Option<(Option<String>, Option<String>)>, th: Theme) -> Result<()> {
+async fn make(env: &Env, i: &Interaction, m: &Message, mem: Option<(Option<String>, Option<String>)>, th: Theme, context: bool) -> Result<()> {
 	let bg = if th == Theme::White { 255 } else { 0 };
 	let fwd = unforward(m);
 	let m = fwd.as_ref().unwrap_or(m);
@@ -295,7 +298,13 @@ async fn make(i: &Interaction, m: &Message, mem: Option<(Option<String>, Option<
 	let av = rgb(&avatar(m.author.id, m.author.avatar.map(|h| h.to_string()), guild), bg).await;
 	let name = nick.or_else(|| m.author.global_name.clone()).unwrap_or_else(|| m.author.name.clone());
 	let user = format!("@{}", m.author.name);
-	let reply = if fwd.is_some() { Some("Forwarded".into()) } else { m.referenced_message.as_ref().map(|r| format!("Replying to @{}", r.author.global_name.as_deref().unwrap_or(&r.author.name))) };
+	let referenced = if context {
+		match m.referenced_message.clone() {
+			Some(r) => Some(r),
+			None => match m.message_reference.as_ref().and_then(|r| r.channel_id.zip(r.message_id)) { Some((c, id)) => get(env, c, id).await, None => None },
+		}
+	} else { None };
+	let reply = if fwd.is_some() { Some("Forwarded".into()) } else { referenced.as_ref().map(|r| format!("Replying to @{}", r.author.global_name.as_deref().unwrap_or(&r.author.name))) };
 	let (text, emoji) = emojis(&text, &emo, bg).await;
 	let (fb, sty) = join(fonts(&format!("{text}{name}{user}{}", reply.as_deref().unwrap_or_default())), styled(&text)).await;
 	let mut fr = vec![];
