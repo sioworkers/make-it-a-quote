@@ -18,6 +18,8 @@ const SRC: &str = "https://github.com/sioworkers/make-it-a-quote";
 const FB: &[&str] = &["Noto Sans Math", "Noto Emoji", "Noto Sans Symbols 2", "Noto Sans Symbols", "Noto Sans JP", "Noto Sans KR", "Noto Sans SC", "Noto Sans Arabic", "Noto Sans Hebrew", "Noto Sans Devanagari", "Noto Sans Thai"]; // fallback order
 const MAX_PX: u64 = 4_200_000; // decode cap (~2048x2048), bigger = cpu limit
 const UA: &str = "Mozilla/5.0 (compatible; MIAQ; +https://miaq.sioworker.workers.dev)";
+const TWEMOJI: &str = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@17.0.3/assets/72x72";
+const MAX_EMO: usize = 30; // distinct emoji fetched per quote, custom + unicode
 const PREVIEW: (u64, &str) = (1182288174731505688, "I've built this so I don't have to pay $1/month."); // home page card
 
 pub struct Quote;
@@ -215,9 +217,64 @@ fn md(s: &str) -> String { // discord markdown -> formatted text
 	o
 }
 
-fn clean(m: &Message) -> (String, Vec<(u64, String)>) { // discord markup -> styled text, custom emoji -> char EMO+k w/ (id, name)
+struct Emo { urls: Vec<String>, alt: String } // image urls to try, text if none load
+
+fn put_emo(o: &mut String, emo: &mut Vec<Emo>, urls: Vec<String>, alt: &str) -> bool { // char EMO+k, dedup by url, false = over cap
+	let k = match emo.iter().position(|e| e.urls[0] == urls[0]) {
+		Some(k) => k,
+		None if emo.len() < MAX_EMO => { emo.push(Emo { urls, alt: alt.into() });emo.len() - 1 }
+		None => return false,
+	};
+	o.push(char::from_u32(card::EMO + k as u32).unwrap_or(' '));
+	true
+}
+
+fn pictographic(c: char) -> bool { // could be an emoji on its own, twemoji 404 sends false positives back to text
+	let u = c as u32;
+	(0x1F000..=0x1FAFF).contains(&u) || (0x2190..=0x2BFF).contains(&u) || matches!(c, '©' | '®' | '‼' | '⁉' | '™' | 'ℹ' | '〰' | '〽' | '㊗' | '㊙')
+}
+
+fn emoji_len(c: &[char]) -> Option<usize> { // chars in the emoji sequence at the start of c
+	let ri = |x: &char| ('\u{1F1E6}'..='\u{1F1FF}').contains(x);
+	let f = c.first()?;
+	if ri(f) { return c.get(1).filter(|x| ri(x)).map(|_| 2); } // flag pair
+	if f.is_ascii_digit() || *f == '#' || *f == '*' { let k = if c.get(1) == Some(&'\u{FE0F}') { 2 } else { 1 };return (c.get(k) == Some(&'\u{20E3}')).then_some(k + 1); } // keycap
+	if !pictographic(*f) || c.get(1) == Some(&'\u{FE0E}') { return None; } // FE0E = text style
+	let mut n = 1;
+	loop {
+		match c.get(n) {
+			Some('\u{FE0F}' | '\u{20E3}' | '\u{1F3FB}'..='\u{1F3FF}' | '\u{E0020}'..='\u{E007F}') => n += 1, // emoji style, skin tone, subdivision tags
+			Some('\u{200D}') if c.get(n + 1).is_some_and(|x| pictographic(*x)) => n += 2, // zwj
+			_ => break,
+		}
+	}
+	Some(n)
+}
+
+fn twemoji(e: &[char]) -> Vec<String> { // file is the hex codepoints, FE0F dropped unless it's a zwj sequence. stripped one as a fallback
+	let code = |keep: bool| e.iter().filter(|&&c| keep || c != '\u{FE0F}').map(|&c| format!("{:x}", c as u32)).collect::<Vec<_>>().join("-");
+	let zwj = e.contains(&'\u{200D}');
+	let mut out = vec![format!("{TWEMOJI}/{}.png", code(zwj))];
+	if zwj && e.contains(&'\u{FE0F}') { out.push(format!("{TWEMOJI}/{}.png", code(false))); }
+	out
+}
+
+fn unicode(s: &str, emo: &mut Vec<Emo>) -> String { // unicode emoji -> char EMO+k
+	let c: Vec<char> = s.chars().collect();
+	let (mut o, mut i) = (String::new(), 0);
+	while i < c.len() {
+		if let Some(n) = emoji_len(&c[i..]) {
+			let e = &c[i..i + n];
+			if put_emo(&mut o, emo, twemoji(e), &e.iter().collect::<String>()) { i += n;continue; }
+		}
+		o.push(c[i]);i += 1;
+	}
+	o
+}
+
+fn clean(m: &Message) -> (String, Vec<Emo>) { // discord markup -> styled text, emoji -> char EMO+k
 	let (mut s, mut emo) = (m.content.clone(), vec![]);
-	s.retain(|c| card::sty(c).is_none()); // markers are ours
+	s.retain(|c| card::sty(c).is_none() && (c as u32) < card::EMO); // markers are ours
 	for u in &m.mentions {
 		let n = format!("@{}", u.member.as_ref().and_then(|x| x.nick.as_deref()).unwrap_or(&u.name));
 		s = s.replace(&format!("<@{}>", u.id), &n).replace(&format!("<@!{}>", u.id), &n);
@@ -229,10 +286,7 @@ fn clean(m: &Message) -> (String, Vec<(u64, String)>) { // discord markup -> sty
 			Some(b) => {
 				let t = &rest[a + 1..a + b];
 				let e = t.strip_prefix("a:").or_else(|| t.strip_prefix(':')).and_then(|e| { let (n, id) = e.split_once(':')?;Some((id.parse::<u64>().ok()?, n.to_string())) });
-				match e {
-					Some((id, n)) if emo.len() < 30 || emo.iter().any(|x: &(u64, String)| x.0 == id) => { let k = emo.iter().position(|x| x.0 == id).unwrap_or_else(|| { emo.push((id, n));emo.len() - 1 });o.push(char::from_u32(card::EMO + k as u32).unwrap_or(' ')); }
-					_ => o += &tag(t),
-				}
+				if !e.is_some_and(|(id, n)| put_emo(&mut o, &mut emo, vec![format!("https://cdn.discordapp.com/emojis/{id}.png?size=64")], &format!(":{n}:"))) { o += &tag(t); }
 				rest = &rest[a + b + 1..];
 			}
 			None => { o += &rest[a..];rest = ""; }
@@ -243,21 +297,25 @@ fn clean(m: &Message) -> (String, Vec<(u64, String)>) { // discord markup -> sty
 		let l = l.trim_start().trim_start_matches("-# ").trim_start_matches(['#', '>']).trim_start();
 		l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")).map_or(l.into(), |r| format!("• {r}"))
 	}).collect();
-	(md(&o.join("\n")), emo)
+	let o = unicode(&o.join("\n"), &mut emo);
+	(md(&o), emo)
 }
 
-async fn emojis(text: &str, emo: &[(u64, String)], bg: u8) -> (String, Vec<RgbImage>) { // fetch custom emoji, ones that fail go back to :name:
-	let got = join_all(emo.iter().map(|(id, _)| rgb_any(format!("https://cdn.discordapp.com/emojis/{id}.png?size=64"), bg))).await;
+async fn emojis(text: &str, emo: &[Emo], bg: u8) -> (String, Vec<RgbImage>) { // fetch emoji, ones that fail go back to their text
+	let got = join_all(emo.iter().map(|e| rgb_first(&e.urls, bg))).await;
 	let (mut imgs, mut map) = (vec![], vec![]);
 	for g in got { map.push(g.map(|i| { imgs.push(i);imgs.len() - 1 })); }
 	let t = text.chars().map(|c| {
 		let k = (c as u32).wrapping_sub(card::EMO) as usize;
-		match map.get(k) { Some(Some(n)) => char::from_u32(card::EMO + *n as u32).unwrap_or(' ').to_string(), Some(None) => format!(":{}:", emo[k].1), None => c.to_string() }
+		match map.get(k) { Some(Some(n)) => char::from_u32(card::EMO + *n as u32).unwrap_or(' ').to_string(), Some(None) => emo[k].alt.clone(), None => c.to_string() }
 	}).collect();
 	(t, imgs)
 }
 
-async fn rgb_any(u: String, bg: u8) -> Option<RgbImage> { rgb(&u, bg).await }
+async fn rgb_first(urls: &[String], bg: u8) -> Option<RgbImage> { // first that loads
+	for u in urls { if let Some(i) = rgb(u, bg).await { return Some(i); } }
+	None
+}
 
 fn avatar(u: Id<UserMarker>, h: Option<String>, guild: Option<(String, String)>) -> String { // server avatar if set, else user, else default
 	match (guild, h) {
@@ -377,6 +435,15 @@ mod tests {
 		let u = unforward(&f).unwrap();
 		assert_eq!((u.content.as_str(), u.author.name.as_str()), ("**hi** there", "fwd"));
 		assert!(unforward(&msg("")).is_none());
+	}
+
+	#[test]
+	fn unicode_emoji() {
+		let seqs = |s: &str| { let mut e = vec![];let o = unicode(s, &mut e);(o.chars().map(|c| if (c as u32) >= card::EMO { '@' } else { c }).collect::<String>(), e.iter().map(|e| e.urls[0].rsplit('/').next().unwrap().trim_end_matches(".png").to_string()).collect::<Vec<_>>()) };
+		assert_eq!(seqs("hi 😂😂!"), ("hi @@!".into(), vec!["1f602".into()]));
+		assert_eq!(seqs("👍🏽 🇵🇱 #️⃣ 3"), ("@ @ @ 3".into(), vec!["1f44d-1f3fd".into(), "1f1f5-1f1f1".into(), "23-20e3".into()]));
+		assert_eq!(seqs("❤️ ❤️‍🔥 👨‍👩‍👧"), ("@ @ @".into(), vec!["2764".into(), "2764-fe0f-200d-1f525".into(), "1f468-200d-1f469-200d-1f467".into()]));
+		assert_eq!(seqs("☺\u{FE0E} 🏴󠁧󠁢󠁥󠁮󠁧󠁿"), ("☺\u{FE0E} @".into(), vec!["1f3f4-e0067-e0062-e0065-e006e-e0067-e007f".into()]));
 	}
 
 	#[test]
